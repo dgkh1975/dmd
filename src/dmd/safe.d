@@ -16,6 +16,7 @@ module dmd.safe;
 import core.stdc.stdio;
 
 import dmd.aggregate;
+import dmd.astenums;
 import dmd.dclass;
 import dmd.declaration;
 import dmd.dscope;
@@ -61,11 +62,21 @@ bool checkUnsafeAccess(Scope* sc, Expression e, bool readonly, bool printmsg)
         const hasPointers = v.type.hasPointers();
         if (hasPointers)
         {
-
             if (v.overlapped && sc.func.setUnsafe())
             {
                 if (printmsg)
                     e.error("field `%s.%s` cannot access pointers in `@safe` code that overlap other fields",
+                        ad.toChars(), v.toChars());
+                return true;
+            }
+        }
+
+        if (v.type.hasInvariant())
+        {
+            if (v.overlapped && sc.func.setUnsafe())
+            {
+                if (printmsg)
+                    e.error("field `%s.%s` cannot access structs with invariants in `@safe` code that overlap other fields",
                         ad.toChars(), v.toChars());
                 return true;
             }

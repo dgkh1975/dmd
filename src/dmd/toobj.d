@@ -23,6 +23,7 @@ import dmd.root.rootobject;
 
 import dmd.aggregate;
 import dmd.arraytypes;
+import dmd.astenums;
 import dmd.attrib;
 import dmd.dclass;
 import dmd.declaration;
@@ -603,7 +604,7 @@ void toObjFile(Dsymbol ds, bool multiobj)
                 assert(0); // this shouldn't be possible
 
             auto dtb = DtBuilder(0);
-            if (config.objfmt == OBJ_MACH && global.params.is64bit && (s.Stype.Tty & mTYLINK) == mTYthread)
+            if (config.objfmt == OBJ_MACH && target.is64bit && (s.Stype.Tty & mTYLINK) == mTYthread)
             {
                 tlsToDt(vd, s, sz, dtb);
             }
@@ -934,7 +935,7 @@ void toObjFile(Dsymbol ds, bool multiobj)
          */
         static void tlsToDt(VarDeclaration vd, Symbol *s, uint sz, ref DtBuilder dtb)
         {
-            assert(config.objfmt == OBJ_MACH && global.params.is64bit && (s.Stype.Tty & mTYLINK) == mTYthread);
+            assert(config.objfmt == OBJ_MACH && target.is64bit && (s.Stype.Tty & mTYLINK) == mTYthread);
 
             Symbol *tlvInit = createTLVDataSymbol(vd, s);
             auto tlvInitDtb = DtBuilder(0);
@@ -949,7 +950,7 @@ void toObjFile(Dsymbol ds, bool multiobj)
             tlvInit.Sdt = tlvInitDtb.finish();
             outdata(tlvInit);
 
-            if (global.params.is64bit)
+            if (target.is64bit)
                 tlvInit.Sclass = SCextern;
 
             Symbol* tlvBootstrap = objmod.tlv_bootstrap();
@@ -969,7 +970,7 @@ void toObjFile(Dsymbol ds, bool multiobj)
          */
         static Symbol *createTLVDataSymbol(VarDeclaration vd, Symbol *s)
         {
-            assert(config.objfmt == OBJ_MACH && global.params.is64bit && (s.Stype.Tty & mTYLINK) == mTYthread);
+            assert(config.objfmt == OBJ_MACH && target.is64bit && (s.Stype.Tty & mTYLINK) == mTYthread);
 
             // Compute identifier for tlv symbol
             OutBuffer buffer;
@@ -1005,7 +1006,7 @@ void toObjFile(Dsymbol ds, bool multiobj)
             final switch (vd.linkage)
             {
                 case LINK.windows:
-                    return global.params.is64bit ? mTYman_c : mTYman_std;
+                    return target.is64bit ? mTYman_c : mTYman_std;
 
                 case LINK.objc:
                 case LINK.c:

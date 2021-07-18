@@ -11,9 +11,11 @@
 
 module dmd.argtypes_sysv_x64;
 
+import dmd.astenums;
 import dmd.declaration;
 import dmd.globals;
 import dmd.mtype;
+import dmd.target;
 import dmd.visitor;
 
 /****************************************************
@@ -263,14 +265,14 @@ extern (C++) final class ToClassesVisitor : Visitor
 
     override void visit(TypeDArray)
     {
-        if (!global.params.isLP64)
+        if (!target.isLP64)
             return one(Class.integer);
         return two(Class.integer, Class.integer);
     }
 
     override void visit(TypeDelegate)
     {
-        if (!global.params.isLP64)
+        if (!target.isLP64)
             return one(Class.integer);
         return two(Class.integer, Class.integer);
     }
@@ -279,8 +281,8 @@ extern (C++) final class ToClassesVisitor : Visitor
     {
         // treat as struct with N fields
 
-        Type baseElemType = t.next.toBasetype();
-        if (baseElemType.ty == Tstruct && !(cast(TypeStruct) baseElemType).sym.isPOD())
+        auto baseElemType = t.next.toBasetype().isTypeStruct();
+        if (baseElemType && !baseElemType.sym.isPOD())
             return memory();
 
         classifyStaticArrayElements(0, t);
@@ -342,10 +344,10 @@ extern (C++) final class ToClassesVisitor : Visitor
             if (foffset & (ftypeAlignment - 1)) // not aligned
                 return memory();
 
-            if (ftype.ty == Tstruct)
-                classifyStructFields(foffset, cast(TypeStruct) ftype);
-            else if (ftype.ty == Tsarray)
-                classifyStaticArrayElements(foffset, cast(TypeSArray) ftype);
+            if (auto ts = ftype.isTypeStruct())
+                classifyStructFields(foffset, ts);
+            else if (auto tsa = ftype.isTypeSArray())
+                classifyStaticArrayElements(foffset, tsa);
             else
             {
                 const fEightbyteStart = foffset / 8;
@@ -360,7 +362,7 @@ extern (C++) final class ToClassesVisitor : Visitor
                 {
                     assert(foffset % 8 == 0 ||
                         fEightbyteEnd - fEightbyteStart <= 1 ||
-                        !global.params.isLP64,
+                        !target.isLP64,
                         "Field not aligned at eightbyte boundary but contributing to multiple eightbytes?"
                     );
                     foreach (i, fclass; classify(ftype, fsize).slice())

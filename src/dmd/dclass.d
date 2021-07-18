@@ -19,6 +19,7 @@ import core.stdc.string;
 import dmd.aggregate;
 import dmd.apply;
 import dmd.arraytypes;
+import dmd.astenums;
 import dmd.gluelayer;
 import dmd.declaration;
 import dmd.dscope;
@@ -497,7 +498,7 @@ extern (C++) class ClassDeclaration : AggregateDeclaration
         if (!members || !symtab) // opaque or addMember is not yet done
         {
             // .stringof is always defined (but may be hidden by some other symbol)
-            if (ident != Id.stringof)
+            if (ident != Id.stringof && !(flags & IgnoreErrors) && semanticRun < PASS.semanticdone)
                 error("is forward referenced when looking for `%s`", ident.toChars());
             //*(char*)0=0;
             return null;
@@ -574,9 +575,10 @@ extern (C++) class ClassDeclaration : AggregateDeclaration
             assert(baseClass.sizeok == Sizeok.done);
 
             alignsize = baseClass.alignsize;
-            structsize = baseClass.structsize;
-            if (classKind == ClassKind.cpp && global.params.targetOS == TargetOS.Windows)
-                structsize = (structsize + alignsize - 1) & ~(alignsize - 1);
+            if (classKind == ClassKind.cpp)
+                structsize = target.cpp.derivedClassOffset(baseClass);
+            else
+                structsize = baseClass.structsize;
         }
         else if (classKind == ClassKind.objc)
             structsize = 0; // no hidden member for an Objective-C class

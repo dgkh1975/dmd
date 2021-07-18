@@ -15,6 +15,7 @@ module dmd.declaration;
 import core.stdc.stdio;
 import dmd.aggregate;
 import dmd.arraytypes;
+import dmd.astenums;
 import dmd.ctorflow;
 import dmd.dclass;
 import dmd.delegatize;
@@ -193,75 +194,6 @@ extern (C++) void ObjectNotFound(Identifier id)
     fatal();
 }
 
-enum STC : ulong
-{
-    undefined_          = 0L,
-    static_             = (1L << 0),
-    extern_             = (1L << 1),
-    const_              = (1L << 2),
-    final_              = (1L << 3),
-    abstract_           = (1L << 4),
-    parameter           = (1L << 5),
-    field               = (1L << 6),
-    override_           = (1L << 7),
-    auto_               = (1L << 8),
-    synchronized_       = (1L << 9),
-    deprecated_         = (1L << 10),
-    in_                 = (1L << 11),   // in parameter
-    out_                = (1L << 12),   // out parameter
-    lazy_               = (1L << 13),   // lazy parameter
-    foreach_            = (1L << 14),   // variable for foreach loop
-                          //(1L << 15)
-    variadic            = (1L << 16),   // the 'variadic' parameter in: T foo(T a, U b, V variadic...)
-    ctorinit            = (1L << 17),   // can only be set inside constructor
-    templateparameter   = (1L << 18),   // template parameter
-    scope_              = (1L << 19),
-    immutable_          = (1L << 20),
-    ref_                = (1L << 21),
-    init                = (1L << 22),   // has explicit initializer
-    manifest            = (1L << 23),   // manifest constant
-    nodtor              = (1L << 24),   // don't run destructor
-    nothrow_            = (1L << 25),   // never throws exceptions
-    pure_               = (1L << 26),   // pure function
-    tls                 = (1L << 27),   // thread local
-    alias_              = (1L << 28),   // alias parameter
-    shared_             = (1L << 29),   // accessible from multiple threads
-    gshared             = (1L << 30),   // accessible from multiple threads, but not typed as "shared"
-    wild                = (1L << 31),   // for "wild" type constructor
-    property            = (1L << 32),
-    safe                = (1L << 33),
-    trusted             = (1L << 34),
-    system              = (1L << 35),
-    ctfe                = (1L << 36),   // can be used in CTFE, even if it is static
-    disable             = (1L << 37),   // for functions that are not callable
-    result              = (1L << 38),   // for result variables passed to out contracts
-    nodefaultctor       = (1L << 39),   // must be set inside constructor
-    temp                = (1L << 40),   // temporary variable
-    rvalue              = (1L << 41),   // force rvalue for variables
-    nogc                = (1L << 42),   // @nogc
-    volatile_           = (1L << 43),   // destined for volatile in the back end
-    return_             = (1L << 44),   // 'return ref' or 'return scope' for function parameters
-    autoref             = (1L << 45),   // Mark for the already deduced 'auto ref' parameter
-    inference           = (1L << 46),   // do attribute inference
-    exptemp             = (1L << 47),   // temporary variable that has lifetime restricted to an expression
-    maybescope          = (1L << 48),   // parameter might be 'scope'
-    scopeinferred       = (1L << 49),   // 'scope' has been inferred and should not be part of mangling
-    future              = (1L << 50),   // introducing new base class function
-    local               = (1L << 51),   // do not forward (see dmd.dsymbol.ForwardingScopeDsymbol).
-    returninferred      = (1L << 52),   // 'return' has been inferred and should not be part of mangling
-    live                = (1L << 53),   // function @live attribute
-
-    // Group members are mutually exclusive (there can be only one)
-    safeGroup = STC.safe | STC.trusted | STC.system,
-
-    /// Group for `in` / `out` / `ref` storage classes on parameter
-    IOR  = STC.in_ | STC.ref_ | STC.out_,
-
-    TYPECTOR = (STC.const_ | STC.immutable_ | STC.shared_ | STC.wild),
-    FUNCATTR = (STC.ref_ | STC.nothrow_ | STC.nogc | STC.pure_ | STC.property | STC.live |
-                STC.safeGroup),
-}
-
 enum STCStorageClass =
     (STC.auto_ | STC.scope_ | STC.static_ | STC.extern_ | STC.const_ | STC.final_ | STC.abstract_ | STC.synchronized_ |
      STC.deprecated_ | STC.future | STC.override_ | STC.lazy_ | STC.alias_ | STC.out_ | STC.in_ | STC.manifest |
@@ -348,11 +280,42 @@ extern (C++) abstract class Declaration : Dsymbol
         if (sc.func && sc.func.storage_class & STC.disable)
             return true;
 
-        auto p = toParent();
-        if (p && isPostBlitDeclaration())
+        if (auto p = toParent())
         {
-            p.error(loc, "is not copyable because it is annotated with `@disable`");
-            return true;
+            if (auto postblit = isPostBlitDeclaration())
+            {
+                /* https://issues.dlang.org/show_bug.cgi?id=21885
+                 *
+                 * If the generated postblit is disabled, it
+                 * means that one of the fields has a disabled
+                 * postblit. Print the first field that has
+                 * a disabled postblit.
+                 */
+                if (postblit.generated)
+                {
+                    auto sd = p.isStructDeclaration();
+                    assert(sd);
+                    for (size_t i = 0; i < sd.fields.dim; i++)
+                    {
+                        auto structField = sd.fields[i];
+                        if (structField.overlapped)
+                            continue;
+                        Type tv = structField.type.baseElemOf();
+                        if (tv.ty != Tstruct)
+                            continue;
+                        auto sdv = (cast(TypeStruct)tv).sym;
+                        if (!sdv.postblit)
+                            continue;
+                        if (sdv.postblit.isDisabled())
+                        {
+                            p.error(loc, "is not copyable because field `%s` is not copyable", structField.toChars());
+                            return true;
+                        }
+                    }
+                }
+                p.error(loc, "is not copyable because it has a disabled postblit");
+                return true;
+            }
         }
 
         // if the function is @disabled, maybe there
@@ -561,6 +524,12 @@ extern (C++) abstract class Declaration : Dsymbol
     final bool isRef() const pure nothrow @nogc @safe
     {
         return (storage_class & STC.ref_) != 0;
+    }
+
+    /// Returns: Whether the variable is a reference, annotated with `out` or `ref`
+    final bool isReference() const pure nothrow @nogc @safe
+    {
+        return (storage_class & (STC.ref_ | STC.out_)) != 0;
     }
 
     final bool isFuture() const pure nothrow @nogc @safe
@@ -1454,14 +1423,22 @@ extern (C++) class VarDeclaration : Declaration
                 //if (cd.isInterfaceDeclaration())
                 //    error("interface `%s` cannot be scope", cd.toChars());
 
-                // Destroying C++ scope classes crashes currently. Since C++ class dtors are not currently supported, simply do not run dtors for them.
-                // See https://issues.dlang.org/show_bug.cgi?id=13182
-                if (cd.classKind == ClassKind.cpp)
-                {
-                    break;
-                }
                 if (mynew || onstack) // if any destructors
                 {
+                    // delete'ing C++ classes crashes (and delete is deprecated anyway)
+                    if (cd.classKind == ClassKind.cpp)
+                    {
+                        // Don't call non-existant dtor
+                        if (!cd.dtor)
+                            break;
+
+                        e = new VarExp(loc, this);
+                        e.type = e.type.mutableOf().unSharedOf(); // Hack for mutable ctor on immutable instances
+                        e = new DotVarExp(loc, e, cd.dtor, false);
+                        e = new CallExp(loc, e);
+                        break;
+                    }
+
                     // delete this;
                     Expression ec;
                     ec = new VarExp(loc, this);
@@ -1643,7 +1620,37 @@ extern (C++) class VarDeclaration : Declaration
      */
     final bool enclosesLifetimeOf(VarDeclaration v) const pure
     {
-        return sequenceNumber < v.sequenceNumber;
+        // VarDeclaration's with these STC's need special treatment
+        enum special = STC.temp | STC.foreach_;
+
+        // Sequence numbers work when there are no special VarDeclaration's involved
+        if (!((this.storage_class | v.storage_class) & special))
+        {
+            // FIXME: VarDeclaration's for parameters are created in semantic3, so
+            //        they will have a greater sequence number than local variables.
+            //        Hence reverse the result for mixed comparisons.
+            const exp = this.isParameter() == v.isParameter();
+
+            return (this.sequenceNumber < v.sequenceNumber) == exp;
+        }
+
+        // Assume that semantic produces temporaries according to their lifetime
+        // (It won't create a temporary before the actual content)
+        if ((this.storage_class & special) && (v.storage_class & special))
+            return this.sequenceNumber < v.sequenceNumber;
+
+        // Fall back to lexical order
+        assert(this.loc != Loc.initial);
+        assert(v.loc != Loc.initial);
+
+        if (auto ld = this.loc.linnum - v.loc.linnum)
+            return ld < 0;
+
+        if (auto cd = this.loc.charnum - v.loc.charnum)
+            return cd < 0;
+
+        // Default fallback
+        return this.sequenceNumber < v.sequenceNumber;
     }
 
     /***************************************

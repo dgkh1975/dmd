@@ -4,6 +4,13 @@ common_steps_template: &COMMON_STEPS_TEMPLATE
   setup_repos_script: |
     set -uexo pipefail
     ln -s $CIRRUS_WORKING_DIR ../dmd
+
+    # for PRs - merge with target branch first
+    if [ ! -z ${CIRRUS_PR+x} ] ; then
+      git fetch origin "+refs/pull/$CIRRUS_PR/merge:";
+      git checkout -f FETCH_HEAD;
+    fi
+
     ./ci.sh setup_repos "${CIRRUS_BASE_BRANCH:-$CIRRUS_BRANCH}"
   build_script: ./ci.sh build
 
@@ -31,7 +38,7 @@ environment:
 
 coverage_environment_template: &COVERAGE_ENVIRONMENT_TEMPLATE
   DMD_TEST_COVERAGE: 1
-  CODECOV_TOKEN: ENCRYPTED[287a085e100f667a399ab7d8024b7c2290b1a528963c87bc168cf855aeb8c676b001eb7cddc570201a8157c5e650e8a1]
+  CODECOV_TOKEN: ENCRYPTED[cc6ce01618eaee6c9a08ebc81446a9233588df3b2c6ba4e30ffb7715ee9815734ccfd9fcec4f6abfc6a1b9dd8253110d]
 
 # Linux
 task:
@@ -73,6 +80,8 @@ task:
     OS_NAME: darwin
     # override Cirrus default OS (`darwin`)
     OS: osx
+    # 12 CPU cores and 24 GB of memory are available
+    N: 12
     matrix:
       - TASK_NAME_SUFFIX: DMD (latest)
       - TASK_NAME_SUFFIX: DMD (coverage)

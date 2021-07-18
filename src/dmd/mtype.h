@@ -44,7 +44,7 @@ void semanticTypeInfo(Scope *sc, Type *t);
 Type *typeSemantic(Type *t, const Loc &loc, Scope *sc);
 Type *merge(Type *type);
 
-enum ENUMTY
+enum class TY : uint8_t
 {
     Tarray,             // slice array, aka T[]
     Tsarray,            // static array, aka T[dimension]
@@ -95,9 +95,10 @@ enum ENUMTY
     Tint128,
     Tuns128,
     Ttraits,
+    Tmixin,
+    Tnoreturn,
     TMAX
 };
-typedef unsigned char TY;       // ENUMTY
 
 #define SIZE_INVALID (~(d_uns64)0)   // error return from size() functions
 
@@ -180,6 +181,7 @@ public:
     static Type *tdstring;              // immutable(dchar)[]
     static Type *terror;                // for error recovery
     static Type *tnull;                 // for null type
+    static Type *tnoreturn;             // for bottom type typeof(*null)
 
     static Type *tsize_t;               // matches size_t alias
     static Type *tptrdiff_t;            // matches ptrdiff_t alias
@@ -205,7 +207,7 @@ public:
 
     static TemplateDeclaration *rtinfo;
 
-    static Type *basic[TMAX];
+    static Type *basic[(int)TY::TMAX];
 
     virtual const char *kind();
     Type *copy() const;
@@ -299,6 +301,7 @@ public:
     virtual int hasWild() const;
     virtual bool hasPointers();
     virtual bool hasVoidInitPointers();
+    virtual bool hasInvariant();
     virtual Type *nextOf();
     Type *baseElemOf();
     uinteger_t sizemask();
@@ -310,6 +313,8 @@ public:
 
     // For eliminating dynamic_cast
     virtual TypeBasic *isTypeBasic();
+    TypeFunction *isPtrToFunction();
+    TypeFunction *isFunction_Delegate_PtrToFunction();
     TypeError *isTypeError();
     TypeVector *isTypeVector();
     TypeSArray *isTypeSArray();
@@ -331,6 +336,8 @@ public:
     TypeNull *isTypeNull();
     TypeMixin *isTypeMixin();
     TypeTraits *isTypeTraits();
+    TypeNoreturn *isTypeNoreturn();
+    TypeTag *isTypeTag();
 
     void accept(Visitor *v) { v->visit(this); }
 };
@@ -440,6 +447,7 @@ public:
     MATCH implicitConvTo(Type *to);
     Expression *defaultInitLiteral(const Loc &loc);
     bool hasPointers();
+    bool hasInvariant();
     bool needsDestruction();
     bool needsCopyOrPostblit();
     bool needsNested();
@@ -631,7 +639,7 @@ class TypeDelegate : public TypeNext
 public:
     // .next is a TypeFunction
 
-    static TypeDelegate *create(Type *t);
+    static TypeDelegate *create(TypeFunction *t);
     const char *kind();
     TypeDelegate *syntaxCopy();
     Type *addStorageClass(StorageClass stc);
@@ -771,6 +779,7 @@ public:
     bool needsNested();
     bool hasPointers();
     bool hasVoidInitPointers();
+    bool hasInvariant();
     MATCH implicitConvTo(Type *to);
     MATCH constConv(Type *to);
     unsigned char deduceWild(Type *t, bool isRef);
@@ -808,6 +817,7 @@ public:
     bool isZeroInit(const Loc &loc);
     bool hasPointers();
     bool hasVoidInitPointers();
+    bool hasInvariant();
     Type *nextOf();
 
     void accept(Visitor *v) { v->visit(this); }
@@ -877,6 +887,28 @@ public:
     bool isBoolean() /*const*/;
 
     d_uns64 size(const Loc &loc) /*const*/;
+    void accept(Visitor *v) { v->visit(this); }
+};
+
+class TypeNoreturn final : public Type
+{
+public:
+    const char *kind();
+    TypeNoreturn *syntaxCopy();
+    MATCH implicitConvTo(Type* to);
+    MATCH constConv(Type* to);
+    bool isBoolean() /* const */;
+    d_uns64 size(const Loc& loc) /* const */;
+    unsigned alignsize();
+
+    void accept(Visitor *v) { v->visit(this); }
+};
+
+class TypeTag final : public Type
+{
+public:
+    TypeTag *syntaxCopy();
+
     void accept(Visitor *v) { v->visit(this); }
 };
 

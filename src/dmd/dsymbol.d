@@ -20,6 +20,7 @@ import dmd.aggregate;
 import dmd.aliasthis;
 import dmd.arraytypes;
 import dmd.attrib;
+import dmd.astenums;
 import dmd.ast_node;
 import dmd.gluelayer;
 import dmd.dclass;
@@ -184,34 +185,6 @@ struct Visibility
         }
         return false;
     }
-
-    extern (C++):
-
-    /**
-     * Checks if parent defines different access restrictions than this one.
-     *
-     * Params:
-     *  parent = visibility attribute for scope that hosts this one
-     *
-     * Returns:
-     *  'true' if parent is already more restrictive than this one and thus
-     *  no differentiation is needed.
-     */
-    bool isSubsetOf(ref const Visibility parent) const
-    {
-        if (this.kind != parent.kind)
-            return false;
-        if (this.kind == Visibility.Kind.package_)
-        {
-            if (!this.pkg)
-                return true;
-            if (!parent.pkg)
-                return false;
-            if (parent.pkg.isAncestorPackageOf(this.pkg))
-                return true;
-        }
-        return true;
-    }
 }
 
 enum PASS : int
@@ -242,6 +215,7 @@ enum : int
                                     // because qualified module searches search
                                     // their imports
     IgnoreSymbolVisibility  = 0x80, // also find private and package protected symbols
+    TagNameSpace            = 0x100, // search ImportC tag symbol table
 }
 
 /***********************************************************
@@ -326,7 +300,9 @@ extern (C++) class Dsymbol : ASTNode
             return false;
         auto s = cast(Dsymbol)o;
         // Overload sets don't have an ident
-        if (s && ident && s.ident && ident.equals(s.ident))
+        // Function-local declarations may have identical names
+        // if they are declared in different scopes
+        if (s && ident && s.ident && ident.equals(s.ident) && localNum == s.localNum)
             return true;
         return false;
     }
@@ -423,6 +399,10 @@ extern (C++) class Dsymbol : ASTNode
             return false;
         // Don't complain if we're inside a deprecated symbol's scope
         if (sc.isDeprecated())
+            return false;
+        // Don't complain if we're inside a template constraint
+        // https://issues.dlang.org/show_bug.cgi?id=21831
+        if (sc.flags & SCOPE.constraint)
             return false;
 
         const(char)* message = null;
@@ -796,6 +776,12 @@ extern (C++) class Dsymbol : ASTNode
             if (isAliasDeclaration() && !_scope)
                 setScope(sc);
             Dsymbol s2 = sds.symtabLookup(this,ident);
+
+            // If using C tag/prototype/forward declaration rules
+            if (sc.flags & SCOPE.Cfile &&
+                handleTagSymbols(*sc, this, s2, sds))
+                    return;
+
             if (!s2.overloadInsert(this))
             {
                 sds.multiplyDefined(Loc.initial, this, s2);
@@ -984,7 +970,7 @@ extern (C++) class Dsymbol : ASTNode
     }
 
     // is Dsymbol deprecated?
-    bool isDeprecated() const
+    bool isDeprecated() @safe @nogc pure nothrow const
     {
         return false;
     }
@@ -1655,6 +1641,13 @@ public:
         return fdx;
     }
 
+    /********************************
+     * Insert Dsymbol in table.
+     * Params:
+     *   s = symbol to add
+     * Returns:
+     *   null if already in table, `s` if inserted
+     */
     Dsymbol symtabInsert(Dsymbol s)
     {
         return symtab.insert(s);
@@ -1662,8 +1655,12 @@ public:
 
     /****************************************
      * Look up identifier in symbol table.
+     * Params:
+     *  s = symbol
+     *  id = identifier to look up
+     * Returns:
+     *   Dsymbol if found, null if not
      */
-
     Dsymbol symtabLookup(Dsymbol s, Identifier id)
     {
         return symtab.lookup(id);
@@ -2168,7 +2165,7 @@ extern (C++) final class AliasAssign : Dsymbol
     Dsymbol aliassym; /// replace previous RHS of AliasDeclaration with `aliassym`
                       /// only one of type and aliassym can be != null
 
-    extern (D) this(const ref Loc loc, Identifier ident, Type type, Dsymbol aliasssym)
+    extern (D) this(const ref Loc loc, Identifier ident, Type type, Dsymbol aliassym)
     {
         super(loc, null);
         this.ident = ident;
@@ -2208,33 +2205,53 @@ extern (C++) final class DsymbolTable : RootObject
 {
     AssocArray!(Identifier, Dsymbol) tab;
 
-    // Look up Identifier. Return Dsymbol if found, NULL if not.
+   /***************************
+    * Look up Identifier in symbol table
+    * Params:
+    *   ident = identifer to look up
+    * Returns:
+    *   Dsymbol if found, null if not
+    */
     Dsymbol lookup(const Identifier ident)
     {
         //printf("DsymbolTable::lookup(%s)\n", ident.toChars());
         return tab[ident];
     }
 
-    // Look for Dsymbol in table. If there, return it. If not, insert s and return that.
-    Dsymbol update(Dsymbol s)
+    /**********
+     * Replace existing symbol in symbol table with `s`.
+     * If it's not there, add it.
+     * Params:
+     *   s = replacement symbol with same identifier
+     */
+    void update(Dsymbol s)
     {
-        const ident = s.ident;
-        Dsymbol* ps = tab.getLvalue(ident);
-        *ps = s;
-        return s;
+        *tab.getLvalue(s.ident) = s;
     }
 
-    // Insert Dsymbol in table. Return NULL if already there.
+    /**************************
+     * Insert Dsymbol in table.
+     * Params:
+     *   s = symbol to add
+     * Returns:
+     *   null if already in table, `s` if inserted
+     */
     Dsymbol insert(Dsymbol s)
     {
-        //printf("DsymbolTable::insert(this = %p, '%s')\n", this, s.ident.toChars());
         return insert(s.ident, s);
     }
 
-    // when ident and s are not the same
+    /**************************
+     * Insert Dsymbol in table.
+     * Params:
+     *   ident = identifier to serve as index
+     *   s = symbol to add
+     * Returns:
+     *   null if already in table, `s` if inserted
+     */
     Dsymbol insert(const Identifier ident, Dsymbol s)
     {
-        //printf("DsymbolTable::insert()\n");
+        //printf("DsymbolTable.insert(this = %p, '%s')\n", this, s.ident.toChars());
         Dsymbol* ps = tab.getLvalue(ident);
         if (*ps)
             return null; // already in table
@@ -2242,7 +2259,7 @@ extern (C++) final class DsymbolTable : RootObject
         return s;
     }
 
-    /*****
+    /*****************
      * Returns:
      *  number of symbols in symbol table
      */
@@ -2251,3 +2268,103 @@ extern (C++) final class DsymbolTable : RootObject
         return tab.length;
     }
 }
+
+/**********************************************
+ * ImportC tag symbols sit in a parallel symbol table,
+ * so that this C code works:
+ * ---
+ * struct S { a; };
+ * int S;
+ * struct S s;
+ * ---
+ * But there are relatively few such tag symbols, so that would be
+ * a waste of memory and complexity. An additional problem is we'd like the D side
+ * to find the tag symbols with ordinary lookup, not lookup in both
+ * tables, if the tag symbol is not conflicting with an ordinary symbol.
+ * The solution is to put the tag symbols that conflict into an associative
+ * array, indexed by the address of the ordinary symbol that conflicts with it.
+ * C has no modules, so this associative array is tagSymTab[] in ModuleDeclaration.
+ * A side effect of our approach is that D code cannot access a tag symbol that is
+ * hidden by an ordinary symbol. This is more of a theoretical problem, as nobody
+ * has mentioned it when importing C headers. If someone wants to do it,
+ * too bad so sad. Change the C code.
+ * This function fixes up the symbol table when faced with adding a new symbol
+ * `s` when there is an existing symbol `s2` with the same name.
+ * C also allows forward and prototype declarations of tag symbols,
+ * this function merges those.
+ * Params:
+ *      sc = context
+ *      s = symbol to add to symbol table
+ *      s2 = existing declaration
+ *      sds = symbol table
+ * Returns:
+ *      if s and s2 are successfully put in symbol table then return the merged symbol,
+ *      null if they conflict
+ */
+Dsymbol handleTagSymbols(ref Scope sc, Dsymbol s, Dsymbol s2, ScopeDsymbol sds)
+{
+    enum log = false;
+    if (log) printf("handleTagSymbols('%s')\n", s.toChars());
+    auto sd = s.isScopeDsymbol(); // new declaration
+    auto sd2 = s2.isScopeDsymbol(); // existing declaration
+
+    if (!sd2)
+    {
+        /* Look in tag table
+         */
+        if (log) printf(" look in tag table\n");
+        if (auto p = cast(void*)s2 in sc._module.tagSymTab)
+        {
+            Dsymbol s2tag = *p;
+            sd2 = s2tag.isScopeDsymbol();
+            assert(sd2);        // only tags allowed in tag symbol table
+        }
+    }
+
+    if (sd && sd2) // `s` is a tag, `sd2` is the same tag
+    {
+        if (log) printf(" tag is already defined\n");
+
+        if (sd.kind() != sd2.kind())  // being enum/struct/union must match
+            return null;              // conflict
+
+        /* Not a redeclaration if one is a forward declaration.
+         * Move members to the first declared type, which is sd2.
+         */
+        if (sd2.members)
+        {
+            if (!sd.members)
+                return sd2;  // ignore the sd redeclaration
+        }
+        else if (sd.members)
+        {
+            sd2.members = sd.members; // transfer definition to sd2
+            sd.members = null;
+            return sd2;
+        }
+        else
+            return sd2; // ignore redeclaration
+    }
+    else if (sd) // `s` is a tag, `s2` is not
+    {
+        if (log) printf(" s is tag, s2 is not\n");
+        /* add `s` as tag indexed by s2
+         */
+        sc._module.tagSymTab[cast(void*)s2] = s;
+        return s;
+    }
+    else if (s2 is sd2) // `s2` is a tag, `s` is not
+    {
+        if (log) printf(" s2 is tag, s is not\n");
+        /* replace `s2` in symbol table with `s`,
+         * then add `s2` as tag indexed by `s`
+         */
+        sds.symtab.update(s);
+        sc._module.tagSymTab[cast(void*)s] = s2;
+        return s;
+    }
+    if (log) printf(" collision\n");
+    return null;
+}
+
+

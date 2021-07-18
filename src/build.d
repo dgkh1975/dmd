@@ -159,6 +159,7 @@ Command-line parameters
     // A more proper solution would be to redirect DMD's output to this script's
     // output using `std.process`', but it's more involved and the following
     // "just works"
+    version(Posix) // UPDATE: only when ANSII color codes are supported, that is. Don't do this on Windows.
     if (!flags["DFLAGS"].canFind("-color=off") &&
         [env["HOST_DMD_RUN"], "-color=on", "-h"].tryRun().status == 0)
         flags["DFLAGS"] ~= "-color=on";
@@ -280,7 +281,8 @@ alias lexer = makeRuleWithArgs!((MethodInitializer!BuildRule builder, BuildRule 
     .command([env["HOST_DMD_RUN"],
         "-c",
         "-of" ~ rule.target,
-        "-vtls"]
+        "-vtls",
+        "-J" ~ env["RES"]]
         .chain(flags["DFLAGS"],
             extraFlags,
             // source files need to have relative paths in order for the code coverage
@@ -874,7 +876,16 @@ alias install = makeRule!((builder, rule) {
             installRelativeFiles(env["INSTALL"], dmdRepo, sourceFiles);
 
         const scPath = buildPath(env["OS"], bin, conf);
-        copyAndTouch(buildPath(dmdRepo, "ini", scPath), buildPath(env["INSTALL"], scPath));
+        const iniPath = buildPath(dmdRepo, "ini");
+
+        // The sources distributed alongside an official release only include the
+        // configuration of the current OS at the root directory instead of the
+        // whole `ini` folder in the project root.
+        const confPath = iniPath.exists()
+                        ? buildPath(iniPath, scPath)
+                        : buildPath(dmdRepo, "..", scPath);
+
+        copyAndTouch(confPath, buildPath(env["INSTALL"], scPath));
 
         version (Posix)
             copyAndTouch(sourceFiles[$-1], env["INSTALL"].buildPath("dmd-boostlicense.txt"));
@@ -1039,7 +1050,7 @@ void parseEnvironment()
     env.setDefault("GIT_HOME", "https://github.com/dlang");
     env.setDefault("SYSCONFDIR", "/etc");
     env.setDefault("TMP", tempDir);
-    env.setDefault("RES", dmdRepo.buildPath("src/dmd/res"));
+    env.setDefault("RES", srcDir.buildPath("dmd", "res"));
     env.setDefault("MAKE", "make");
 
     version (Windows)
@@ -1319,7 +1330,7 @@ auto sourceFiles()
         "),
         frontend: fileArray(env["D"], "
             access.d aggregate.d aliasthis.d apply.d argtypes_x86.d argtypes_sysv_x64.d argtypes_aarch64.d arrayop.d
-            arraytypes.d ast_node.d astcodegen.d asttypename.d attrib.d blockexit.d builtin.d canthrow.d chkformat.d
+            arraytypes.d astenums.d ast_node.d astcodegen.d asttypename.d attrib.d blockexit.d builtin.d canthrow.d chkformat.d
             cli.d clone.d compiler.d complex.d cond.d constfold.d cppmangle.d cppmanglewin.d ctfeexpr.d
             ctorflow.d dcast.d dclass.d declaration.d delegatize.d denum.d dimport.d
             dinterpret.d dmacro.d dmangle.d dmodule.d doc.d dscope.d dstruct.d dsymbol.d dsymbolsem.d
@@ -1330,6 +1341,7 @@ auto sourceFiles()
             semantic2.d semantic3.d sideeffect.d statement.d statement_rewrite_walker.d
             statementsem.d staticassert.d staticcond.d stmtstate.d target.d templateparamsem.d traits.d
             transitivevisitor.d typesem.d typinf.d utils.d visitor.d foreachvar.d
+            cparse.d
         "),
         backendHeaders: fileArray(env["C"], "
             cc.d cdef.d cgcv.d code.d cv4.d dt.d el.d global.d
@@ -1361,7 +1373,7 @@ auto sourceFiles()
         "),
         rootHeaders: fileArray(env["ROOT"], "
             array.h bitarray.h ctfloat.h dcompat.h dsystem.h file.h filename.h longdouble.h
-            object.h outbuffer.h port.h rmem.h root.h
+            object.h outbuffer.h port.h rmem.h
         "),
         backend: fileArray(env["C"], "
             backend.d bcomplex.d evalu8.d divcoeff.d dvec.d go.d gsroa.d glocal.d gdag.d gother.d gflow.d

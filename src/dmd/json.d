@@ -15,6 +15,7 @@ import core.stdc.stdio;
 import core.stdc.string;
 import dmd.aggregate;
 import dmd.arraytypes;
+import dmd.astenums;
 import dmd.attrib;
 import dmd.cond;
 import dmd.dclass;
@@ -35,6 +36,7 @@ import dmd.mtype;
 import dmd.root.outbuffer;
 import dmd.root.rootobject;
 import dmd.root.string;
+import dmd.target;
 import dmd.visitor;
 
 version(Windows) {
@@ -841,28 +843,28 @@ public:
         property("size_t", size_t.sizeof);
         propertyStart("platforms");
         arrayStart();
-        if (global.params.targetOS == TargetOS.Windows)
+        if (target.os == Target.OS.Windows)
         {
             item("windows");
         }
         else
         {
             item("posix");
-            if (global.params.targetOS == TargetOS.linux)
+            if (target.os == Target.OS.linux)
                 item("linux");
-            else if (global.params.targetOS == TargetOS.OSX)
+            else if (target.os == Target.OS.OSX)
                 item("osx");
-            else if (global.params.targetOS == TargetOS.FreeBSD)
+            else if (target.os == Target.OS.FreeBSD)
             {
                 item("freebsd");
                 item("bsd");
             }
-            else if (global.params.targetOS == TargetOS.OpenBSD)
+            else if (target.os == Target.OS.OpenBSD)
             {
                 item("openbsd");
                 item("bsd");
             }
-            else if (global.params.targetOS == TargetOS.Solaris)
+            else if (target.os == Target.OS.Solaris)
             {
                 item("solaris");
                 item("bsd");

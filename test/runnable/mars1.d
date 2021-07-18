@@ -1008,25 +1008,6 @@ void testshrshl()
 
 ////////////////////////////////////////////////////////////////////////
 
-struct S1
-{
-    cdouble val;
-}
-
-void formatTest(S1 s, double re, double im)
-{
-    assert(s.val.re == re);
-    assert(s.val.im == im);
-}
-
-void test10639()
-{
-    S1 s = S1(3+2.25i);
-    formatTest(s, 3, 2.25);
-}
-
-////////////////////////////////////////////////////////////////////////
-
 bool bt10715(in uint[] ary, size_t bitnum)
 {
     return !!(ary[bitnum >> 5] & 1 << (bitnum & 31)); // uses bt
@@ -1328,18 +1309,6 @@ void test14829()
         assert(0);
 }
 
-
-////////////////////////////////////////////////////////////////////////
-
-void test2()
-{
-    void test(cdouble v)
-    {
-            auto x2 = cdouble(v);
-            assert(x2 == v);
-    }
-    test(1.2+3.4i);
-}
 
 ////////////////////////////////////////////////////////////////////////
 
@@ -2122,6 +2091,37 @@ void testsbbrex()
 
 ////////////////////////////////////////////////////////////////////////
 
+// https://issues.dlang.org/show_bug.cgi?id=19846
+
+alias Void = byte[0];
+static immutable Void VOID; // = [];
+
+__gshared int x19846;
+
+Void print19846()
+{
+    //printf("This should print\n");
+    x19846 = 3;
+    return VOID;
+}
+
+Void identity19846(Void value, out int i)
+{
+    i = 7;
+    return value;
+}
+
+void test19846()
+{
+    int i;
+    identity19846(print19846(), i);
+    //printf("i = %d\n", i);
+    assert(x19846 == 3);
+    assert(i == 7);
+}
+
+////////////////////////////////////////////////////////////////////////
+
 // Some tests for OPmemcpy
 
 enum N = 128;
@@ -2238,7 +2238,6 @@ void test21038()
 }
 
 ////////////////////////////////////////////////////////////////////////
-
 // https://issues.dlang.org/show_bug.cgi?id=21325
 
 real f21325(const real x) pure @safe nothrow @nogc
@@ -2261,34 +2260,30 @@ void test21325() @safe
 }
 
 ////////////////////////////////////////////////////////////////////////
+// https://issues.dlang.org/show_bug.cgi?id=16274
 
-// https://issues.dlang.org/show_bug.cgi?id=19846
+extern(C) int pair(short a, ushort b, byte c, ubyte d);
 
-alias Void = byte[0];
-static immutable Void VOID; // = [];
-
-__gshared int x19846;
-
-Void print19846()
+struct S
 {
-    //printf("This should print\n");
-    x19846 = 3;
-    return VOID;
+    // provide alternate implementation of .pair()
+    pragma(mangle, "pair")
+    extern(C) static void pair(int a, int b, int c, int d)
+    {
+        //printf("%d %d %d %d\n", a, b, c, d);
+        assert(a == -1);
+        assert(b == 2);
+        assert(c == -3);
+        assert(d == 4);
+    }
 }
 
-Void identity19846(Void value, out int i)
+void test16274()
 {
-    i = 7;
-    return value;
-}
-
-void test19846()
-{
-    int i;
-    identity19846(print19846(), i);
-    //printf("i = %d\n", i);
-    assert(x19846 == 3);
-    assert(i == 7);
+    version (X86_64)
+        pair(-1, 2, -3, 4);
+    version (X86)
+        pair(-1, 2, -3, 4);
 }
 
 ////////////////////////////////////////////////////////////////////////
@@ -2369,6 +2364,30 @@ void test11435b()
     abc(px[0..2]);
 }
 
+////////////////////////////////////////////////////////////////////////
+// https://issues.dlang.org/show_bug.cgi?id=21513
+
+struct Stuff
+{
+    size_t c;         // declare after items and not crash !
+    ubyte[1] items;
+}
+
+void grow(ref Stuff stuff)
+{
+    with (stuff)
+    {
+        const oldCapacity = c;
+        items.ptr[0..oldCapacity] = items.ptr[0..0]; // use literal 0 instead of
+        items.ptr[0] = 0;                            // oldcapacity and no crash !
+    }
+}
+
+void test21513()
+{
+    Stuff stuff;
+    grow(stuff);
+}
 
 ////////////////////////////////////////////////////////////////////////
 // https://issues.dlang.org/show_bug.cgi?id=21526
@@ -2399,6 +2418,53 @@ void test21256()
     // cannot seem to get the two to produce the same value
     assert(r.l == 0x4341c37937e08001 || // value using XMM
            r.l == 0x4341c37937e08002);  // value using x87
+}
+
+////////////////////////////////////////////////////////////////////////
+// https://issues.dlang.org/show_bug.cgi?id=21816
+
+bool test21816a(float t)
+{
+    return cast(bool)t;
+}
+
+void test21816()
+{
+    assert(test21816a(float.nan));
+}
+
+////////////////////////////////////////////////////////////////////////
+// https://issues.dlang.org/show_bug.cgi?id=21835
+
+struct Point21835
+{
+    float  f = 3.0;
+    double d = 4.0;
+    real   r = 5.0;
+}
+
+void test21835y()
+{
+    Point21835[1] arr;
+    if (arr[0].f != 3.0) assert(0);
+    if (arr[0].d != 4.0) assert(0);
+    if (arr[0].r != 5.0) assert(0);
+}
+
+struct Point21835x
+{
+    float  f = 0.0;
+    double d = 0.0;
+    real   r = 0.0;
+}
+
+void test21835()
+{
+    test21835y();
+    Point21835x[1] arr;
+    if (arr[0].f != 0.0) assert(0);
+    if (arr[0].d != 0.0) assert(0);
+    if (arr[0].r != 0.0) assert(0);
 }
 
 ////////////////////////////////////////////////////////////////////////
@@ -2442,7 +2508,6 @@ int main()
     test13190();
     test13485();
     test14436();
-    test10639();
     test10715();
     test10678();
     test7565();
@@ -2454,7 +2519,6 @@ int main()
     test13784();
     test14220();
     test14829();
-    test2();
     test3();
     test14782();
     test14987();
@@ -2488,16 +2552,20 @@ int main()
     test20162();
     test3713();
     testsbbrex();
+    test19846();
     testmemcpy();
     testMulLea();
     testMulAssPair();
     test21038();
     test21325();
-    test19846();
+    test16274();
     test16268();
     test11435a();
     test11435b();
+    test21513();
     test21256();
+    test21816();
+    test21835();
 
     printf("Success\n");
     return 0;

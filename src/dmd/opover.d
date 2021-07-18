@@ -17,6 +17,7 @@ import core.stdc.stdio;
 import dmd.aggregate;
 import dmd.aliasthis;
 import dmd.arraytypes;
+import dmd.astenums;
 import dmd.dclass;
 import dmd.declaration;
 import dmd.dscope;
@@ -209,13 +210,11 @@ private Expression checkAliasThisForLhs(AggregateDeclaration ad, Scope* sc, BinE
     /* Rewrite (e1 op e2) as:
      *      (e1.aliasthis op e2)
      */
-    if (e.att1 && e.e1.type.equivalent(e.att1))
+    if (isRecursiveAliasThis(e.att1, e.e1.type))
         return null;
     //printf("att %s e1 = %s\n", Token::toChars(e.op), e.e1.type.toChars());
     Expression e1 = new DotIdExp(e.loc, e.e1, ad.aliasthis.ident);
     BinExp be = cast(BinExp)e.copy();
-    if (!be.att1 && e.e1.type.checkAliasThisRec())
-        be.att1 = e.e1.type;
     be.e1 = e1;
 
     Expression result;
@@ -235,13 +234,11 @@ private Expression checkAliasThisForRhs(AggregateDeclaration ad, Scope* sc, BinE
     /* Rewrite (e1 op e2) as:
      *      (e1 op e2.aliasthis)
      */
-    if (e.att2 && e.e2.type.equivalent(e.att2))
+    if (isRecursiveAliasThis(e.att2, e.e2.type))
         return null;
     //printf("att %s e2 = %s\n", Token::toChars(e.op), e.e2.type.toChars());
     Expression e2 = new DotIdExp(e.loc, e.e2, ad.aliasthis.ident);
     BinExp be = cast(BinExp)e.copy();
-    if (!be.att2 && e.e2.type.checkAliasThisRec())
-        be.att2 = e.e2.type;
     be.e2 = e2;
 
     Expression result;
@@ -367,10 +364,8 @@ Expression op_overload(Expression e, Scope* sc, TOK* pop = null)
                         return;
                     }
                     // Didn't find it. Forward to aliasthis
-                    if (ad.aliasthis && !(ae.att1 && t1b.equivalent(ae.att1)))
+                    if (ad.aliasthis && !isRecursiveAliasThis(ae.att1, ae.e1.type))
                     {
-                        if (!ae.att1 && t1b.checkAliasThisRec())
-                            ae.att1 = t1b;
                         /* Rewrite op(a[arguments]) as:
                          *      op(a.aliasthis[arguments])
                          */
@@ -423,7 +418,7 @@ Expression op_overload(Expression e, Scope* sc, TOK* pop = null)
                     }
                 }
                 // Didn't find it. Forward to aliasthis
-                if (ad.aliasthis && !(e.att1 && e.e1.type.equivalent(e.att1)))
+                if (ad.aliasthis && !isRecursiveAliasThis(e.att1, e.e1.type))
                 {
                     /* Rewrite op(e1) as:
                      *      op(e1.aliasthis)
@@ -431,8 +426,6 @@ Expression op_overload(Expression e, Scope* sc, TOK* pop = null)
                     //printf("att una %s e1 = %s\n", Token::toChars(op), this.e1.type.toChars());
                     Expression e1 = new DotIdExp(e.loc, e.e1, ad.aliasthis.ident);
                     UnaExp ue = cast(UnaExp)e.copy();
-                    if (!ue.att1 && e.e1.type.checkAliasThisRec())
-                        ue.att1 = e.e1.type;
                     ue.e1 = e1;
                     result = ue.trySemantic(sc);
                     return;
@@ -542,10 +535,8 @@ Expression op_overload(Expression e, Scope* sc, TOK* pop = null)
                     return;
                 }
                 // Didn't find it. Forward to aliasthis
-                if (ad.aliasthis && !(ae.att1 && t1b.equivalent(ae.att1)))
+                if (ad.aliasthis && !isRecursiveAliasThis(ae.att1, ae.e1.type))
                 {
-                    if (!ae.att1 && t1b.checkAliasThisRec())
-                        ae.att1 = t1b;
                     //printf("att arr e1 = %s\n", this.e1.type.toChars());
                     /* Rewrite op(a[arguments]) as:
                      *      op(a.aliasthis[arguments])
@@ -595,7 +586,7 @@ Expression op_overload(Expression e, Scope* sc, TOK* pop = null)
                     return;
                 }
                 // Didn't find it. Forward to aliasthis
-                if (ad.aliasthis)
+                if (ad.aliasthis && !isRecursiveAliasThis(e.att1, e.e1.type))
                 {
                     /* Rewrite op(e1) as:
                      *      op(e1.aliasthis)
@@ -749,7 +740,7 @@ Expression op_overload(Expression e, Scope* sc, TOK* pop = null)
                     // Error, ambiguous
                     e.error("overloads `%s` and `%s` both match argument list for `%s`", m.lastf.type.toChars(), m.nextf.type.toChars(), m.lastf.toChars());
                 }
-                else if (m.last <= MATCH.nomatch)
+                else if (m.last == MATCH.nomatch)
                 {
                     if (tiargs)
                         goto L1;
@@ -763,7 +754,7 @@ Expression op_overload(Expression e, Scope* sc, TOK* pop = null)
                     // Rewrite (e1 -- e2) as e1.postdec()
                     result = build_overload(e.loc, sc, e.e1, null, m.lastf ? m.lastf : s);
                 }
-                else if (lastf && m.lastf == lastf || !s_r && m.last <= MATCH.nomatch)
+                else if (lastf && m.lastf == lastf || !s_r && m.last == MATCH.nomatch)
                 {
                     // Rewrite (e1 op e2) as e1.opfunc(e2)
                     result = build_overload(e.loc, sc, e.e1, e.e2, m.lastf ? m.lastf : s);
@@ -834,12 +825,12 @@ Expression op_overload(Expression e, Scope* sc, TOK* pop = null)
                             // Error, ambiguous
                             e.error("overloads `%s` and `%s` both match argument list for `%s`", m.lastf.type.toChars(), m.nextf.type.toChars(), m.lastf.toChars());
                         }
-                        else if (m.last <= MATCH.nomatch)
+                        else if (m.last == MATCH.nomatch)
                         {
                             m.lastf = null;
                         }
 
-                        if (lastf && m.lastf == lastf || !s && m.last <= MATCH.nomatch)
+                        if (lastf && m.lastf == lastf || !s && m.last == MATCH.nomatch)
                         {
                             // Rewrite (e1 op e2) as e1.opfunc_r(e2)
                             result = build_overload(e.loc, sc, e.e1, e.e2, m.lastf ? m.lastf : s_r);
@@ -1209,10 +1200,8 @@ Expression op_overload(Expression e, Scope* sc, TOK* pop = null)
                         return;
                     }
                     // Didn't find it. Forward to aliasthis
-                    if (ad.aliasthis && !(ae.att1 && t1b.equivalent(ae.att1)))
+                    if (ad.aliasthis && !isRecursiveAliasThis(ae.att1, ae.e1.type))
                     {
-                        if (!ae.att1 && t1b.checkAliasThisRec())
-                            ae.att1 = t1b;
                         /* Rewrite (a[arguments] op= e2) as:
                          *      a.aliasthis[arguments] op= e2
                          */
@@ -1296,7 +1285,7 @@ Expression op_overload(Expression e, Scope* sc, TOK* pop = null)
                     // Error, ambiguous
                     e.error("overloads `%s` and `%s` both match argument list for `%s`", m.lastf.type.toChars(), m.nextf.type.toChars(), m.lastf.toChars());
                 }
-                else if (m.last <= MATCH.nomatch)
+                else if (m.last == MATCH.nomatch)
                 {
                     if (tiargs)
                         goto L1;
@@ -1395,12 +1384,12 @@ private Expression compare_overload(BinExp e, Scope* sc, Identifier id, TOK* pop
                 e.error("overloads `%s` and `%s` both match argument list for `%s`", m.lastf.type.toChars(), m.nextf.type.toChars(), m.lastf.toChars());
             }
         }
-        else if (m.last <= MATCH.nomatch)
+        else if (m.last == MATCH.nomatch)
         {
             m.lastf = null;
         }
         Expression result;
-        if (lastf && m.lastf == lastf || !s_r && m.last <= MATCH.nomatch)
+        if (lastf && m.lastf == lastf || !s_r && m.last == MATCH.nomatch)
         {
             // Rewrite (e1 op e2) as e1.opfunc(e2)
             result = build_overload(e.loc, sc, e.e1, e.e2, m.lastf ? m.lastf : s);
@@ -1535,10 +1524,8 @@ bool inferForeachAggregate(Scope* sc, bool isForeach, ref Expression feaggr, out
             }
             if (ad.aliasthis)
             {
-                if (att && tab.equivalent(att))         // error, circular alias this
+                if (isRecursiveAliasThis(att, tab))     // error, circular alias this
                     return false;
-                if (!att && tab.checkAliasThisRec())
-                    att = tab;
                 aggr = resolveAliasThis(sc, aggr);
                 continue;
             }

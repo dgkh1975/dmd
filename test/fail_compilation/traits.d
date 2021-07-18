@@ -81,3 +81,38 @@ extern(C++, __traits(getCppNamespaces, foobar1.func2)) void func1 () {}
 extern(C++, foobar1)
 extern(C++, __traits(getCppNamespaces, bar1.func)) void func2 () {}
 
+/********************************************
+https://issues.dlang.org/show_bug.cgi?id=21918
+
+TEST_OUTPUT:
+---
+fail_compilation/traits.d(501): Error: undefined identifier `T`
+fail_compilation/traits.d(502):        while evaluating `pragma(msg, __traits(getParameterStorageClasses, yip, 0))`
+---
+*/
+#line 500
+
+auto yip(int f) {return T[];}
+pragma(msg, __traits(getParameterStorageClasses, yip, 0));
+
+
+/********************************************
+TEST_OUTPUT:
+---
+fail_compilation/traits.d(602): Error: expected 1 arguments for `hasCopyConstructor` but had 0
+fail_compilation/traits.d(602):        while evaluating `pragma(msg, __traits(hasCopyConstructor))`
+fail_compilation/traits.d(603): Error: type expected as second argument of __traits `hasCopyConstructor` instead of `S()`
+fail_compilation/traits.d(603):        while evaluating `pragma(msg, __traits(hasCopyConstructor, S()))`
+fail_compilation/traits.d(604): Error: expected 1 arguments for `hasPostblit` but had 0
+fail_compilation/traits.d(604):        while evaluating `pragma(msg, __traits(hasPostblit))`
+fail_compilation/traits.d(605): Error: type expected as second argument of __traits `hasPostblit` instead of `S()`
+fail_compilation/traits.d(605):        while evaluating `pragma(msg, __traits(hasPostblit, S()))`
+---
+*/
+#line 600
+
+struct S { this (ref S rhs) {} }
+pragma(msg, __traits(hasCopyConstructor));
+pragma(msg, __traits(hasCopyConstructor, S()));
+pragma(msg, __traits(hasPostblit));
+pragma(msg, __traits(hasPostblit, S()));

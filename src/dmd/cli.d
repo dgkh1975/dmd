@@ -33,8 +33,8 @@ enum TargetOS : ubyte
     DragonFlyBSD = 0x40,
 
     // Combination masks
-    all = linux | Windows | OSX | FreeBSD | Solaris | DragonFlyBSD,
-    Posix = linux | OSX | FreeBSD | Solaris | DragonFlyBSD,
+    all = linux | Windows | OSX | OpenBSD | FreeBSD | Solaris | DragonFlyBSD,
+    Posix = linux | OSX | OpenBSD | FreeBSD | Solaris | DragonFlyBSD,
 }
 
 // Detect the current TargetOS
@@ -49,6 +49,10 @@ else version(Windows)
 else version(OSX)
 {
     private enum targetOS = TargetOS.OSX;
+}
+else version(OpenBSD)
+{
+    private enum targetOS = TargetOS.OpenBSD;
 }
 else version(FreeBSD)
 {
@@ -345,6 +349,10 @@ dmd -cov -unittest myprog.d
             "generate position independent code",
             cast(TargetOS) (TargetOS.all & ~(TargetOS.Windows | TargetOS.OSX))
         ),
+        Option("fPIE",
+            "generate position independent executables",
+            cast(TargetOS) (TargetOS.all & ~(TargetOS.Windows | TargetOS.OSX))
+        ),
         Option("g",
             "add symbolic debug info",
             `$(WINDOWS
@@ -503,11 +511,14 @@ dmd -cov -unittest myprog.d
             unittesting a library, as it enables running the unittests
             in a library without having to manually define an entry-point function.`,
         ),
-        Option("makedeps",
-            "print module dependencies in Makefile compatible format to stdout"
-        ),
-        Option("makedeps=<filename>",
-            "write module dependencies in Makefile compatible format to filename (only imports)"
+        Option("makedeps[=<filename>]",
+            "print dependencies in Makefile compatible format to filename or stdout.",
+            `Print dependencies in Makefile compatible format.
+            If filename is omitted, it prints to stdout.
+            The emitted targets are the compiled artifacts (executable, object files, libraries).
+            The emitted dependencies are imported modules and imported string files (via $(B -J) switch).
+            Special characters in a dependency or target filename are escaped in the GNU Make manner.
+            `,
         ),
         Option("man",
             "open web browser on manual page",
@@ -660,6 +671,23 @@ dmd -cov -unittest myprog.d
             `$(UNIX Generate shared library)
              $(WINDOWS Generate DLL library)`,
         ),
+        Option("target=<triple>",
+               "use <triple> as <arch>-[<vendor>-]<os>[-<cenv>[-<cppenv]]",
+               "$(I arch) is the architecture: either `x86`, `x64`, `x86_64` or `x32`,
+               $(I vendor) is always ignored, but supported for easier interoperability,
+               $(I os) is the operating system, this may have a trailing version number:
+               `freestanding` for no operating system,
+               `darwin` or `osx` for MacOS, `dragonfly` or `dragonflybsd` for DragonflyBSD,
+               `freebsd`, `openbsd`, `linux`, `solaris` or `windows` for their respective operating systems.
+               $(I cenv) is the C runtime environment and is optional: `musl` for musl-libc,
+               `msvc` for the MSVC runtime (the default for windows with this option),
+               `bionic` for the Andriod libc, `digital_mars` for the Digital Mars runtime for Windows
+               `gnu` or `glibc` for the GCC C runtime, `newlib` or `uclibc` for their respective C runtimes.
+               ($ I cppenv) is the C++ runtime environment: `clang` for the LLVM C++ runtime
+               `gcc` for GCC's C++ runtime, `msvc` for microsoft's MSVC C++ runtime (the default for windows with this switch),
+               `sun` for Sun's C++ runtime and `digital_mars` for the Digital Mars C++ runtime for windows.
+               "
+        ),
         Option("transition=<name>",
             "help with language change identified by 'name'",
             `Show additional info about language change identified by $(I id)`,
@@ -759,7 +787,7 @@ dmd -cov -unittest myprog.d
         Feature("field", "vfield",
             "list all non-mutable fields which occupy an object instance"),
         Feature("complex", "vcomplex",
-            "give deprecation messages about all usages of complex or imaginary types"),
+            "give deprecation messages about all usages of complex or imaginary types", false, true),
         Feature("tls", "vtls",
             "list all variables going into thread local storage"),
         Feature("vmarkdown", "vmarkdown",
@@ -777,7 +805,7 @@ dmd -cov -unittest myprog.d
     static immutable previews = [
         Feature("dip25", "useDIP25",
             "implement https://github.com/dlang/DIPs/blob/master/DIPs/archive/DIP25.md (Sealed references)"),
-        Feature("dip1000", "vsafe",
+        Feature("dip1000", "useDIP1000",
             "implement https://github.com/dlang/DIPs/blob/master/DIPs/other/DIP1000.md (Scoped Pointers)"),
         Feature("dip1008", "ehnogc",
             "implement https://github.com/dlang/DIPs/blob/master/DIPs/other/DIP1008.md (@nogc Throwable)"),

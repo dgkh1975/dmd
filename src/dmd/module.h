@@ -75,6 +75,7 @@ public:
     unsigned errors;    // if any errors in file
     unsigned numlines;  // number of lines in source file
     bool isHdrFile;     // if it is a header (.di) file
+    bool isCFile;       // if it is a C (.c) file
     bool isDocFile;     // if it is a documentation input file, not D source
     bool hasAlwaysInlines; // contains references to functions that must be inlined
     bool isPackageFile; // if it is a package.d
@@ -82,6 +83,7 @@ public:
     Strings contentImportedFiles;  // array of files whose content was imported
     int needmoduleinfo;
     int selfimports;            // 0: don't know, 1: does not, 2: does
+    void* tagSymTab;            // ImportC: tag symbols that conflict with other symbols used as the index
     bool selfImports();         // returns true if module imports itself
 
     int rootimports;            // 0: don't know, 1: does not, 2: does
@@ -164,7 +166,7 @@ struct ModuleDeclaration
 {
     Loc loc;
     Identifier *id;
-    Identifiers *packages;            // array of Identifier's representing packages
+    DArray<Identifier*> packages;  // array of Identifier's representing packages
     bool isdeprecated;  // if it is a deprecated module
     Expression *msg;
 

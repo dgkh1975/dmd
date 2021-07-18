@@ -20,6 +20,7 @@ import core.stdc.string;
 import dmd.aggregate;
 import dmd.arraytypes;
 import dmd.attrib;
+import dmd.astenums;
 import dmd.ast_node;
 import dmd.gluelayer;
 import dmd.dclass;
@@ -223,138 +224,11 @@ StorageClass ModToStc(uint mod) pure nothrow @nogc @safe
     return stc;
 }
 
-private enum TFlags
-{
-    integral     = 1,
-    floating     = 2,
-    unsigned     = 4,
-    real_        = 8,
-    imaginary    = 0x10,
-    complex      = 0x20,
-}
-
-enum ENUMTY : int
-{
-    Tarray,     // slice array, aka T[]
-    Tsarray,    // static array, aka T[dimension]
-    Taarray,    // associative array, aka T[type]
-    Tpointer,
-    Treference,
-    Tfunction,
-    Tident,
-    Tclass,
-    Tstruct,
-    Tenum,
-
-    Tdelegate,
-    Tnone,
-    Tvoid,
-    Tint8,
-    Tuns8,
-    Tint16,
-    Tuns16,
-    Tint32,
-    Tuns32,
-    Tint64,
-
-    Tuns64,
-    Tfloat32,
-    Tfloat64,
-    Tfloat80,
-    Timaginary32,
-    Timaginary64,
-    Timaginary80,
-    Tcomplex32,
-    Tcomplex64,
-    Tcomplex80,
-
-    Tbool,
-    Tchar,
-    Twchar,
-    Tdchar,
-    Terror,
-    Tinstance,
-    Ttypeof,
-    Ttuple,
-    Tslice,
-    Treturn,
-
-    Tnull,
-    Tvector,
-    Tint128,
-    Tuns128,
-    Ttraits,
-    Tmixin,
-    TMAX,
-}
-
-alias Tarray = ENUMTY.Tarray;
-alias Tsarray = ENUMTY.Tsarray;
-alias Taarray = ENUMTY.Taarray;
-alias Tpointer = ENUMTY.Tpointer;
-alias Treference = ENUMTY.Treference;
-alias Tfunction = ENUMTY.Tfunction;
-alias Tident = ENUMTY.Tident;
-alias Tclass = ENUMTY.Tclass;
-alias Tstruct = ENUMTY.Tstruct;
-alias Tenum = ENUMTY.Tenum;
-alias Tdelegate = ENUMTY.Tdelegate;
-alias Tnone = ENUMTY.Tnone;
-alias Tvoid = ENUMTY.Tvoid;
-alias Tint8 = ENUMTY.Tint8;
-alias Tuns8 = ENUMTY.Tuns8;
-alias Tint16 = ENUMTY.Tint16;
-alias Tuns16 = ENUMTY.Tuns16;
-alias Tint32 = ENUMTY.Tint32;
-alias Tuns32 = ENUMTY.Tuns32;
-alias Tint64 = ENUMTY.Tint64;
-alias Tuns64 = ENUMTY.Tuns64;
-alias Tfloat32 = ENUMTY.Tfloat32;
-alias Tfloat64 = ENUMTY.Tfloat64;
-alias Tfloat80 = ENUMTY.Tfloat80;
-alias Timaginary32 = ENUMTY.Timaginary32;
-alias Timaginary64 = ENUMTY.Timaginary64;
-alias Timaginary80 = ENUMTY.Timaginary80;
-alias Tcomplex32 = ENUMTY.Tcomplex32;
-alias Tcomplex64 = ENUMTY.Tcomplex64;
-alias Tcomplex80 = ENUMTY.Tcomplex80;
-alias Tbool = ENUMTY.Tbool;
-alias Tchar = ENUMTY.Tchar;
-alias Twchar = ENUMTY.Twchar;
-alias Tdchar = ENUMTY.Tdchar;
-alias Terror = ENUMTY.Terror;
-alias Tinstance = ENUMTY.Tinstance;
-alias Ttypeof = ENUMTY.Ttypeof;
-alias Ttuple = ENUMTY.Ttuple;
-alias Tslice = ENUMTY.Tslice;
-alias Treturn = ENUMTY.Treturn;
-alias Tnull = ENUMTY.Tnull;
-alias Tvector = ENUMTY.Tvector;
-alias Tint128 = ENUMTY.Tint128;
-alias Tuns128 = ENUMTY.Tuns128;
-alias Ttraits = ENUMTY.Ttraits;
-alias Tmixin = ENUMTY.Tmixin;
-alias TMAX = ENUMTY.TMAX;
-
-alias TY = ubyte;
-
 ///Returns true if ty is char, wchar, or dchar
 bool isSomeChar(TY ty) pure nothrow @nogc @safe
 {
     return ty == Tchar || ty == Twchar || ty == Tdchar;
 }
-
-enum MODFlags : int
-{
-    const_       = 1,    // type is const
-    immutable_   = 4,    // type is immutable
-    shared_      = 2,    // type is shared
-    wild         = 8,    // type is wild
-    wildconst    = (MODFlags.wild | MODFlags.const_), // type is wild const
-    mutable      = 0x10, // type is mutable (only used in wildcard matching)
-}
-
-alias MOD = ubyte;
 
 /****************
  * dotExp() bit flags
@@ -364,19 +238,6 @@ enum DotExpFlag
     gag     = 1,    // don't report "not a property" error and just return null
     noDeref = 2,    // the use of the expression will not attempt a dereference
 }
-
-/***************
- * Variadic argument lists
- * https://dlang.org/spec/function.html#variadic
- */
-enum VarArg : ubyte
-{
-    none     = 0,  /// fixed number of arguments
-    variadic = 1,  /// (T t, ...)  can be C-style (core.stdc.stdarg) or D-style (core.vararg)
-    typesafe = 2,  /// (T t ...) typesafe https://dlang.org/spec/function.html#typesafe_variadic_functions
-                   ///   or https://dlang.org/spec/function.html#typesafe_variadic_functions
-}
-
 
 /***********************************************************
  */
@@ -449,6 +310,7 @@ extern (C++) abstract class Type : ASTNode
     extern (C++) __gshared Type tdstring;    // immutable(dchar)[]
     extern (C++) __gshared Type terror;      // for error recovery
     extern (C++) __gshared Type tnull;       // for null type
+    extern (C++) __gshared Type tnoreturn;   // for bottom type typeof(*null)
 
     extern (C++) __gshared Type tsize_t;     // matches size_t alias
     extern (C++) __gshared Type tptrdiff_t;  // matches ptrdiff_t alias
@@ -501,6 +363,8 @@ extern (C++) abstract class Type : ASTNode
             sizeTy[Tvector] = __traits(classInstanceSize, TypeVector);
             sizeTy[Ttraits] = __traits(classInstanceSize, TypeTraits);
             sizeTy[Tmixin] = __traits(classInstanceSize, TypeMixin);
+            sizeTy[Tnoreturn] = __traits(classInstanceSize, TypeNoreturn);
+            sizeTy[Ttag] = __traits(classInstanceSize, TypeTag);
             return sizeTy;
         }();
 
@@ -706,6 +570,9 @@ extern (C++) abstract class Type : ASTNode
                 if (t2bn.ty == Tnull || t2bn.ty == Tpointer || t2bn.ty == Tclass)
                     goto Lcovariant;
             }
+            // bottom type is covariant to any type
+            else if (t1n.ty == Tnoreturn)
+                goto Lcovariant;
         }
         goto Lnotcovariant;
 
@@ -862,6 +729,10 @@ extern (C++) abstract class Type : ASTNode
         }
         basic[Terror] = new TypeError();
 
+        tnoreturn = new TypeNoreturn();
+        tnoreturn.deco = tnoreturn.merge().deco;
+        basic[Tnoreturn] = tnoreturn;
+
         tvoid = basic[Tvoid];
         tint8 = basic[Tint8];
         tuns8 = basic[Tuns8];
@@ -892,6 +763,7 @@ extern (C++) abstract class Type : ASTNode
 
         tshiftcnt = tint32;
         terror = basic[Terror];
+        tnoreturn = basic[Tnoreturn];
         tnull = new TypeNull();
         tnull.deco = tnull.merge().deco;
 
@@ -900,7 +772,7 @@ extern (C++) abstract class Type : ASTNode
         twstring = twchar.immutableOf().arrayOf();
         tdstring = tdchar.immutableOf().arrayOf();
 
-        const isLP64 = global.params.isLP64;
+        const isLP64 = target.isLP64;
 
         tsize_t    = basic[isLP64 ? Tuns64 : Tuns32];
         tptrdiff_t = basic[isLP64 ? Tint64 : Tint32];
@@ -2320,7 +2192,7 @@ extern (C++) abstract class Type : ASTNode
                 }
                 else if (ty == Tdelegate)
                 {
-                    t = new TypeDelegate(t);
+                    t = new TypeDelegate(t.isTypeFunction());
                 }
                 else
                     assert(0);
@@ -2500,6 +2372,15 @@ extern (C++) abstract class Type : ASTNode
         return false;
     }
 
+    /***************************************
+     * Returns: true if type has any invariants
+     */
+    bool hasInvariant()
+    {
+        //printf("Type::hasInvariant() %s, %d\n", toChars(), ty);
+        return false;
+    }
+
     /*************************************
      * If this is a type of something, return that something.
      */
@@ -2622,6 +2503,10 @@ extern (C++) abstract class Type : ASTNode
     {
         if (sc.isDeprecated())
             return false;
+        // Don't complain if we're inside a template constraint
+        // https://issues.dlang.org/show_bug.cgi?id=21831
+        if (sc.flags & SCOPE.constraint)
+            return false;
 
         Type t = baseElemOf();
         while (t.ty == Tpointer || t.ty == Tarray)
@@ -2678,6 +2563,38 @@ extern (C++) abstract class Type : ASTNode
 
     final pure inout nothrow @nogc
     {
+        /****************
+         * Is this type a pointer to a function?
+         * Returns:
+         *  the function type if it is
+         */
+        inout(TypeFunction) isPtrToFunction()
+        {
+            return (ty == Tpointer && (cast(TypePointer)this).next.ty == Tfunction)
+                ? cast(typeof(return))(cast(TypePointer)this).next
+                : null;
+        }
+
+        /*****************
+         * Is this type a function, delegate, or pointer to a function?
+         * Returns:
+         *  the function type if it is
+         */
+        inout(TypeFunction) isFunction_Delegate_PtrToFunction()
+        {
+            return ty == Tfunction ? cast(typeof(return))this :
+
+                   ty == Tdelegate ? cast(typeof(return))(cast(TypePointer)this).next :
+
+                   ty == Tpointer && (cast(TypePointer)this).next.ty == Tfunction ?
+                        cast(typeof(return))(cast(TypePointer)this).next :
+
+                   null;
+        }
+    }
+
+    final pure inout nothrow @nogc
+    {
         inout(TypeError)      isTypeError()      { return ty == Terror     ? cast(typeof(return))this : null; }
         inout(TypeVector)     isTypeVector()     { return ty == Tvector    ? cast(typeof(return))this : null; }
         inout(TypeSArray)     isTypeSArray()     { return ty == Tsarray    ? cast(typeof(return))this : null; }
@@ -2699,6 +2616,8 @@ extern (C++) abstract class Type : ASTNode
         inout(TypeNull)       isTypeNull()       { return ty == Tnull      ? cast(typeof(return))this : null; }
         inout(TypeMixin)      isTypeMixin()      { return ty == Tmixin     ? cast(typeof(return))this : null; }
         inout(TypeTraits)     isTypeTraits()     { return ty == Ttraits    ? cast(typeof(return))this : null; }
+        inout(TypeNoreturn)   isTypeNoreturn()   { return ty == Tnoreturn  ? cast(typeof(return))this : null; }
+        inout(TypeTag)        isTypeTag()        { return ty == Ttag       ? cast(typeof(return))this : null; }
     }
 
     override void accept(Visitor v)
@@ -3752,6 +3671,11 @@ extern (C++) final class TypeSArray : TypeArray
             return next.hasPointers();
     }
 
+    override bool hasInvariant()
+    {
+        return next.hasInvariant();
+    }
+
     override bool needsDestruction()
     {
         return next.needsDestruction();
@@ -4152,14 +4076,6 @@ enum RET : int
     stack        = 2,    // returned on stack
 }
 
-enum TRUST : ubyte
-{
-    default_   = 0,
-    system     = 1,    // @system (same as TRUST.default)
-    trusted    = 2,    // @trusted
-    safe       = 3,    // @safe
-}
-
 enum TRUSTformat : int
 {
     TRUSTformatDefault,     // do not emit @system when trust == TRUST.default_
@@ -4168,15 +4084,6 @@ enum TRUSTformat : int
 
 alias TRUSTformatDefault = TRUSTformat.TRUSTformatDefault;
 alias TRUSTformatSystem = TRUSTformat.TRUSTformatSystem;
-
-enum PURE : ubyte
-{
-    impure      = 0,    // not pure at all
-    fwdref      = 1,    // it's pure, but not known which level yet
-    weak        = 2,    // no mutable globals are read or written
-    const_      = 3,    // parameters are values or const
-    strong      = 4,    // parameters are values or immutable
-}
 
 /***********************************************************
  */
@@ -4267,6 +4174,7 @@ extern (C++) final class TypeFunction : TypeNext
         t.mod = mod;
         t.isnothrow = isnothrow;
         t.isnogc = isnogc;
+        t.islive = islive;
         t.purity = purity;
         t.isproperty = isproperty;
         t.isref = isref;
@@ -4441,7 +4349,7 @@ extern (C++) final class TypeFunction : TypeNext
     {
         //printf("parameterStorageClass(p: %s)\n", p.toChars());
         auto stc = p.storageClass;
-        if (!global.params.vsafe)
+        if (global.params.useDIP1000 != FeatureState.enabled)
             return stc;
 
         // When the preview switch is enable, `in` parameters are `scope`
@@ -4889,20 +4797,24 @@ extern (C++) final class TypeFunction : TypeNext
                         }
                     }
 
-                    /* Find most derived alias this type being matched.
-                     * https://issues.dlang.org/show_bug.cgi?id=15674
-                     * Allow on both ref and out parameters.
-                     */
-                    Type firsttab = ta.toBasetype();
-                    while (1)
+                    /* If the match is not already perfect or if the arg
+                       is not a lvalue then try the `alias this` chain
+                       see  https://issues.dlang.org/show_bug.cgi?id=15674
+                       and https://issues.dlang.org/show_bug.cgi?id=21905
+                    */
+                    if (ta != tp || !arg.isLvalue())
                     {
-                        Type tab = ta.toBasetype();
-                        Type tat = tab.aliasthisOf();
-                        if (!tat || !tat.implicitConvTo(tprm))
-                            break;
-                        if (tat == tab || tat == firsttab)
-                            break;
-                        ta = tat;
+                        Type firsttab = ta.toBasetype();
+                        while (1)
+                        {
+                            Type tab = ta.toBasetype();
+                            Type tat = tab.aliasthisOf();
+                            if (!tat || !tat.implicitConvTo(tprm))
+                                break;
+                            if (tat == tab || tat == firsttab)
+                                break;
+                            ta = tat;
+                        }
                     }
 
                     /* A ref variable should work like a head-const reference.
@@ -5238,13 +5150,13 @@ extern (C++) final class TypeDelegate : TypeNext
 {
     // .next is a TypeFunction
 
-    extern (D) this(Type t)
+    extern (D) this(TypeFunction t)
     {
         super(Tfunction, t);
         ty = Tdelegate;
     }
 
-    static TypeDelegate create(Type t)
+    static TypeDelegate create(TypeFunction t)
     {
         return new TypeDelegate(t);
     }
@@ -5256,11 +5168,11 @@ extern (C++) final class TypeDelegate : TypeNext
 
     override TypeDelegate syntaxCopy()
     {
-        Type t = next.syntaxCopy();
-        if (t == next)
+        auto tf = next.syntaxCopy().isTypeFunction();
+        if (tf == next)
             return this;
 
-        auto result = new TypeDelegate(t);
+        auto result = new TypeDelegate(tf);
         result.mod = mod;
         return result;
     }
@@ -5268,7 +5180,7 @@ extern (C++) final class TypeDelegate : TypeNext
     override Type addStorageClass(StorageClass stc)
     {
         TypeDelegate t = cast(TypeDelegate)Type.addStorageClass(stc);
-        if (!global.params.vsafe)
+        if (global.params.useDIP1000 != FeatureState.enabled)
             return t;
 
         /* The rest is meant to add 'scope' to a delegate declaration if it is of the form:
@@ -5511,6 +5423,7 @@ extern (C++) abstract class TypeQualified : Type
             case statement:
             case condition:
             case templateparameter:
+            case initializer:
             }
             idents[i] = id;
         }
@@ -5732,17 +5645,6 @@ extern (C++) final class TypeReturn : TypeQualified
     }
 }
 
-// Whether alias this dependency is recursive or not.
-enum AliasThisRec : int
-{
-    no           = 0,    // no alias this recursion
-    yes          = 1,    // alias this has recursive dependency
-    fwdref       = 2,    // not yet known
-    typeMask     = 3,    // mask to read no/yes/fwdref
-    tracing      = 0x4,  // mark in progress of implicitConvTo/deduceWild
-    tracingDT    = 0x8,  // mark in progress of deduceType
-}
-
 /***********************************************************
  */
 extern (C++) final class TypeStruct : Type
@@ -5961,6 +5863,24 @@ extern (C++) final class TypeStruct : Type
         return false;
     }
 
+    override bool hasInvariant()
+    {
+        // Probably should cache this information in sym rather than recompute
+        StructDeclaration s = sym;
+
+        sym.size(Loc.initial); // give error for forward references
+
+        if (s.hasInvariant())
+            return true;
+
+        foreach (VarDeclaration v; s.fields)
+        {
+            if (v.type.hasInvariant())
+                return true;
+        }
+        return false;
+    }
+
     extern (D) MATCH implicitConvToWithoutAliasThis(Type to)
     {
         MATCH m;
@@ -5993,7 +5913,7 @@ extern (C++) final class TypeStruct : Type
                         }
                         else
                         {
-                            if (m <= MATCH.nomatch)
+                            if (m == MATCH.nomatch)
                                 return m;
                         }
 
@@ -6007,7 +5927,7 @@ extern (C++) final class TypeStruct : Type
                         MATCH mf = tvf.implicitConvTo(tv);
                         //printf("\t%s => %s, match = %d\n", v.type.toChars(), tv.toChars(), mf);
 
-                        if (mf <= MATCH.nomatch)
+                        if (mf == MATCH.nomatch)
                             return mf;
                         if (mf < m) // if field match is worse
                             m = mf;
@@ -6235,6 +6155,11 @@ extern (C++) final class TypeEnum : Type
     override bool hasVoidInitPointers()
     {
         return memType().hasVoidInitPointers();
+    }
+
+    override bool hasInvariant()
+    {
+        return memType().hasInvariant();
     }
 
     override Type nextOf()
@@ -6655,6 +6580,116 @@ extern (C++) final class TypeNull : Type
 }
 
 /***********************************************************
+ */
+extern (C++) final class TypeNoreturn : Type
+{
+    extern (D) this()
+    {
+        //printf("TypeNoreturn %p\n", this);
+        super(Tnoreturn);
+    }
+
+    override const(char)* kind() const
+    {
+        return "noreturn";
+    }
+
+    override TypeNoreturn syntaxCopy()
+    {
+        // No semantic analysis done, no need to copy
+        return this;
+    }
+
+    override MATCH implicitConvTo(Type to)
+    {
+        //printf("TypeNoreturn::implicitConvTo(this=%p, to=%p)\n", this, to);
+        //printf("from: %s\n", toChars());
+        //printf("to  : %s\n", to.toChars());
+        if (this.equals(to))
+            return MATCH.exact;
+
+        // Different qualifiers?
+        if (to.ty == Tnoreturn)
+            return MATCH.constant;
+
+        // Implicitly convertible to any type
+        return MATCH.convert;
+    }
+
+    override MATCH constConv(Type to)
+    {
+        // Either another noreturn or conversion to any type
+        return this.implicitConvTo(to);
+    }
+
+    override bool isBoolean() const
+    {
+        return true;  // bottom type can be implicitly converted to any other type
+    }
+
+    override d_uns64 size(const ref Loc loc) const
+    {
+        return 0;
+    }
+
+    override uint alignsize()
+    {
+        return 0;
+    }
+
+    override void accept(Visitor v)
+    {
+        v.visit(this);
+    }
+}
+
+/***********************************************************
+ * Unlike D, C can declare/define struct/union/enum tag names
+ * inside Declarators, instead of separately as in D.
+ * The order these appear in the symbol table must be in lexical
+ * order. There isn't enough info at the parsing stage to determine if
+ * it's a declaration or a reference to an existing name, so this Type
+ * collects the necessary info and defers it to semantic().
+ */
+extern (C++) final class TypeTag : Type
+{
+    Loc loc;                /// location of declaration
+    TOK tok;                /// TOK.struct_, TOK.union_, TOK.enum_
+    Identifier id;          /// tag name identifier
+    Dsymbols* members;      /// members of struct, null if none
+
+    Type resolved;          /// type after semantic() in case there are more others
+                            /// pointing to this instance, which can happen with
+                            ///   struct S { int a; } s1, *s2;
+
+    extern (D) this(const ref Loc loc, TOK tok, Identifier id, Dsymbols* members)
+    {
+        //printf("TypeTag %p\n", this);
+        super(Ttag);
+        this.loc = loc;
+        this.tok = tok;
+        this.id = id;
+        this.members = members;
+    }
+
+    override const(char)* kind() const
+    {
+        return "tag";
+    }
+
+    override TypeTag syntaxCopy()
+    {
+        // No semantic analysis done, no need to copy
+        return this;
+    }
+
+    override void accept(Visitor v)
+    {
+        v.visit(this);
+    }
+}
+
+/***********************************************************
  * Represents a function's formal parameters + variadics info.
  * Length, indexing and iteration are based on a depth-first tuple expansion.
  * https://dlang.org/spec/function.html#ParameterList
@@ -6665,6 +6700,7 @@ extern (C++) struct ParameterList
     Parameters* parameters;
     StorageClass stc;                   // storage class of ...
     VarArg varargs = VarArg.none;
+    bool hasIdentifierList;             // true if C identifier-list style
 
     this(Parameters* parameters, VarArg varargs = VarArg.none, StorageClass stc = 0)
     {
@@ -6989,53 +7025,16 @@ extern (C++) final class Parameter : ASTNode
         if (from == to)
             return true;
 
-        /* Shrinking the representation is necessary because StorageClass is so wide
-         * Params:
-         *   returnByRef = true if the function returns by ref
-         *   stc = storage class of parameter
-         */
-        static uint buildSR(bool returnByRef, StorageClass stc) pure nothrow @nogc @safe
-        {
-            uint result;
-            final switch (stc & (STC.ref_ | STC.scope_ | STC.return_))
-            {
-                case 0:                    result = SR.None;        break;
-                case STC.ref_:               result = SR.Ref;         break;
-                case STC.scope_:             result = SR.Scope;       break;
-                case STC.return_ | STC.ref_:   result = SR.ReturnRef;   break;
-                case STC.return_ | STC.scope_: result = SR.ReturnScope; break;
-                case STC.ref_    | STC.scope_: result = SR.RefScope;    break;
-                case STC.return_ | STC.ref_ | STC.scope_:
-                    result = returnByRef ? SR.ReturnRef_Scope : SR.Ref_ReturnScope;
-                    break;
-            }
-            return result;
-        }
-
         /* result is true if the 'from' can be used as a 'to'
          */
 
         if ((from ^ to) & STC.ref_)               // differing in 'ref' means no covariance
             return false;
 
-        return covariant[buildSR(returnByRef, from)][buildSR(returnByRef, to)];
+        return covariant[buildScopeRef(returnByRef, from)][buildScopeRef(returnByRef, to)];
     }
 
-    /* Classification of 'scope-return-ref' possibilities
-     */
-    private enum SR
-    {
-        None,
-        Scope,
-        ReturnScope,
-        Ref,
-        ReturnRef,
-        RefScope,
-        ReturnRef_Scope,
-        Ref_ReturnScope,
-    }
-
-    extern (D) private static bool[SR.max + 1][SR.max + 1] covariantInit() pure nothrow @nogc @safe
+    extern (D) private static bool[ScopeRef.max + 1][ScopeRef.max + 1] covariantInit() pure nothrow @nogc @safe
     {
         /* Initialize covariant[][] with this:
 
@@ -7051,26 +7050,32 @@ extern (C++) final class Parameter : ASTNode
              ReturnRef-Scope       X       X
              Ref-ReturnScope   X   X            X
         */
-        bool[SR.max + 1][SR.max + 1] covariant;
+        bool[ScopeRef.max + 1][ScopeRef.max + 1] covariant;
 
-        foreach (i; 0 .. SR.max + 1)
+        foreach (i; 0 .. ScopeRef.max + 1)
         {
             covariant[i][i] = true;
-            covariant[SR.RefScope][i] = true;
+            covariant[ScopeRef.RefScope][i] = true;
         }
-        covariant[SR.ReturnScope][SR.None]        = true;
-        covariant[SR.Scope      ][SR.None]        = true;
-        covariant[SR.Scope      ][SR.ReturnScope] = true;
+        covariant[ScopeRef.ReturnScope][ScopeRef.None]        = true;
+        covariant[ScopeRef.Scope      ][ScopeRef.None]        = true;
+        covariant[ScopeRef.Scope      ][ScopeRef.ReturnScope] = true;
 
-        covariant[SR.Ref            ][SR.ReturnRef] = true;
-        covariant[SR.ReturnRef_Scope][SR.ReturnRef] = true;
-        covariant[SR.Ref_ReturnScope][SR.Ref      ] = true;
-        covariant[SR.Ref_ReturnScope][SR.ReturnRef] = true;
+        covariant[ScopeRef.Ref            ][ScopeRef.ReturnRef] = true;
+        covariant[ScopeRef.ReturnRef_Scope][ScopeRef.ReturnRef] = true;
+        covariant[ScopeRef.Ref_ReturnScope][ScopeRef.Ref      ] = true;
+        covariant[ScopeRef.Ref_ReturnScope][ScopeRef.ReturnRef] = true;
 
         return covariant;
     }
 
-    extern (D) private static immutable bool[SR.max + 1][SR.max + 1] covariant = covariantInit();
+    extern (D) private static immutable bool[ScopeRef.max + 1][ScopeRef.max + 1] covariant = covariantInit();
+
+    extern (D) bool opEquals(const Parameter other) const
+    {
+        return this.storageClass == other.storageClass
+            && this.type == other.type;
+    }
 }
 
 /*************************************************************
@@ -7210,3 +7215,52 @@ bool isCopyable(Type t)
     }
     return true;
 }
+
+/***************************************
+ * Computes how a parameter may be returned.
+ * Shrinking the representation is necessary because StorageClass is so wide
+ * Params:
+ *   returnByRef = true if the function returns by ref
+ *   stc = storage class of parameter
+ * Returns:
+ *   value from enum ScopeRef
+ */
+ScopeRef buildScopeRef(bool returnByRef, StorageClass stc) pure nothrow @nogc @safe
+{
+    if (stc & STC.out_)
+        stc |= STC.ref_;        // treat `out` and `ref` the same
+
+    ScopeRef result;
+    final switch (stc & (STC.ref_ | STC.scope_ | STC.return_))
+    {
+        case 0:                        result = ScopeRef.None;        break;
+        case STC.ref_:                 result = ScopeRef.Ref;         break;
+        case STC.scope_:               result = ScopeRef.Scope;       break;
+        case STC.return_ | STC.ref_:   result = ScopeRef.ReturnRef;   break;
+        case STC.return_ | STC.scope_: result = ScopeRef.ReturnScope; break;
+        case STC.ref_    | STC.scope_: result = ScopeRef.RefScope;    break;
+
+        case STC.return_ | STC.ref_ | STC.scope_:
+            result = returnByRef ? ScopeRef.ReturnRef_Scope
+                                 : ScopeRef.Ref_ReturnScope;
+            break;
+    }
+    return result;
+}
+
+/**
+ * Classification of 'scope-return-ref' possibilities
+ */
+enum ScopeRef
+{
+    None,
+    Scope,
+    ReturnScope,
+    Ref,
+    ReturnRef,
+    RefScope,
+    ReturnRef_Scope,
+    Ref_ReturnScope,
+}
+
+

@@ -68,6 +68,12 @@ enum class ClassKind : uint8_t
   objc
 };
 
+struct MangleOverride
+{
+    Dsymbol *agg;
+    Identifier *id;
+};
+
 class AggregateDeclaration : public ScopeDsymbol
 {
 public:
@@ -81,6 +87,8 @@ public:
     ClassKind classKind;        // specifies the linkage type
     CPPMANGLE cppmangle;
 
+    // overridden symbol with pragma(mangle, "...")
+    MangleOverride *mangleOverride;
     /* !=NULL if is nested
      * pointing to the dsymbol that directly enclosing it.
      * 1. The function that enclosing it (nested struct and class)
@@ -118,7 +126,6 @@ public:
 
     virtual Scope *newScope(Scope *sc);
     void setScope(Scope *sc);
-    bool determineFields();
     size_t nonHiddenFields();
     bool determineSize(Loc loc);
     virtual void finalizeSize() = 0;
@@ -136,9 +143,10 @@ public:
     // 'this' type
     Type *handleType() { return type; }
 
+    bool hasInvariant();
+
     // Back end
-    Symbol *stag;               // tag symbol for debug data
-    Symbol *sinit;
+    void *sinit;
 
     AggregateDeclaration *isAggregateDeclaration() { return this; }
     void accept(Visitor *v) { v->visit(this); }
@@ -184,11 +192,9 @@ public:
 
     static StructDeclaration *create(Loc loc, Identifier *id, bool inObject);
     StructDeclaration *syntaxCopy(Dsymbol *s);
-    void semanticTypeInfoMembers();
     Dsymbol *search(const Loc &loc, Identifier *ident, int flags = SearchLocalsOnly);
     const char *kind() const;
     void finalizeSize();
-    bool fit(const Loc &loc, Scope *sc, Expressions *elements, Type *stype);
     bool isPOD();
 
     StructDeclaration *isStructDeclaration() { return this; }
@@ -278,6 +284,7 @@ public:
     Symbol *cpp_type_info_ptr_sym;      // cached instance of class Id.cpp_type_info_ptr
 
     static ClassDeclaration *create(Loc loc, Identifier *id, BaseClasses *baseclasses, Dsymbols *members, bool inObject);
+    const char *toPrettyChars(bool QualifyTypes = false);
     ClassDeclaration *syntaxCopy(Dsymbol *s);
     Scope *newScope(Scope *sc);
     bool isBaseOf2(ClassDeclaration *cd);

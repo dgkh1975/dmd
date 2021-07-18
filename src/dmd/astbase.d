@@ -10,6 +10,7 @@
 
 module dmd.astbase;
 
+import dmd.astenums;
 import dmd.parsetimevisitor;
 
 /** The ASTBase  family defines a family of AST nodes appropriate for parsing with
@@ -51,271 +52,16 @@ struct ASTBase
     alias Identifiers           = Array!(Identifier);
     alias Initializers          = Array!(Initializer);
     alias Ensures               = Array!(Ensure);
-
-    enum Sizeok : ubyte
-    {
-        none,               // size of aggregate is not yet able to compute
-        fwd,                // size of aggregate is ready to compute
-        done,               // size of aggregate is set correctly
-    }
-
-    enum Baseok : ubyte
-    {
-        none,               // base classes not computed yet
-        start,              // in process of resolving base classes
-        done,               // all base classes are resolved
-        semanticdone,       // all base classes semantic done
-    }
-
-    enum MODFlags : int
-    {
-        const_       = 1,    // type is const
-        immutable_   = 4,    // type is immutable
-        shared_      = 2,    // type is shared
-        wild         = 8,    // type is wild
-        wildconst    = (MODFlags.wild | MODFlags.const_), // type is wild const
-        mutable      = 0x10, // type is mutable (only used in wildcard matching)
-    }
-
-    alias MOD = ubyte;
-
-    enum STC : ulong
-    {
-        undefined_          = 0L,
-        static_             = (1L << 0),
-        extern_             = (1L << 1),
-        const_              = (1L << 2),
-        final_              = (1L << 3),
-        abstract_           = (1L << 4),
-        parameter           = (1L << 5),
-        field               = (1L << 6),
-        override_           = (1L << 7),
-        auto_               = (1L << 8),
-        synchronized_       = (1L << 9),
-        deprecated_         = (1L << 10),
-        in_                 = (1L << 11),   // in parameter
-        out_                = (1L << 12),   // out parameter
-        lazy_               = (1L << 13),   // lazy parameter
-        foreach_            = (1L << 14),   // variable for foreach loop
-                              //(1L << 15)
-        variadic            = (1L << 16),   // the 'variadic' parameter in: T foo(T a, U b, V variadic...)
-        ctorinit            = (1L << 17),   // can only be set inside constructor
-        templateparameter   = (1L << 18),   // template parameter
-        scope_              = (1L << 19),
-        immutable_          = (1L << 20),
-        ref_                = (1L << 21),
-        init                = (1L << 22),   // has explicit initializer
-        manifest            = (1L << 23),   // manifest constant
-        nodtor              = (1L << 24),   // don't run destructor
-        nothrow_            = (1L << 25),   // never throws exceptions
-        pure_               = (1L << 26),   // pure function
-        tls                 = (1L << 27),   // thread local
-        alias_              = (1L << 28),   // alias parameter
-        shared_             = (1L << 29),   // accessible from multiple threads
-        gshared             = (1L << 30),   // accessible from multiple threads, but not typed as "shared"
-        wild                = (1L << 31),   // for "wild" type constructor
-        property            = (1L << 32),
-        safe                = (1L << 33),
-        trusted             = (1L << 34),
-        system              = (1L << 35),
-        ctfe                = (1L << 36),   // can be used in CTFE, even if it is static
-        disable             = (1L << 37),   // for functions that are not callable
-        result              = (1L << 38),   // for result variables passed to out contracts
-        nodefaultctor       = (1L << 39),   // must be set inside constructor
-        temp                = (1L << 40),   // temporary variable
-        rvalue              = (1L << 41),   // force rvalue for variables
-        nogc                = (1L << 42),   // @nogc
-        volatile_           = (1L << 43),   // destined for volatile in the back end
-        return_             = (1L << 44),   // 'return ref' or 'return scope' for function parameters
-        autoref             = (1L << 45),   // Mark for the already deduced 'auto ref' parameter
-        inference           = (1L << 46),   // do attribute inference
-        exptemp             = (1L << 47),   // temporary variable that has lifetime restricted to an expression
-        maybescope          = (1L << 48),   // parameter might be 'scope'
-        scopeinferred       = (1L << 49),   // 'scope' has been inferred and should not be part of mangling
-        future              = (1L << 50),   // introducing new base class function
-        local               = (1L << 51),   // do not forward (see dmd.dsymbol.ForwardingScopeDsymbol).
-        returninferred      = (1L << 52),   // 'return' has been inferred and should not be part of mangling
-        live                = (1L << 53),   // function @live attribute
-
-        safeGroup = STC.safe | STC.trusted | STC.system,
-        IOR  = STC.in_ | STC.ref_ | STC.out_,
-        TYPECTOR = (STC.const_ | STC.immutable_ | STC.shared_ | STC.wild),
-        FUNCATTR = (STC.ref_ | STC.nothrow_ | STC.nogc | STC.pure_ | STC.property | STC.live |
-                    safeGroup),
-    }
+    alias Designators           = Array!(Designator);
+    alias DesigInits            = Array!(DesigInit);
 
     extern (C++) __gshared const(StorageClass) STCStorageClass =
         (STC.auto_ | STC.scope_ | STC.static_ | STC.extern_ | STC.const_ | STC.final_ |
          STC.abstract_ | STC.synchronized_ | STC.deprecated_ | STC.override_ | STC.lazy_ |
          STC.alias_ | STC.out_ | STC.in_ | STC.manifest | STC.immutable_ | STC.shared_ |
          STC.wild | STC.nothrow_ | STC.nogc | STC.pure_ | STC.ref_ | STC.return_ | STC.tls |
-         STC.gshared | STC.property | STC.live |
+         STC.gshared | STC.property | STC.future | STC.local | STC.live |
          STC.safeGroup | STC.disable);
-
-    enum ENUMTY : int
-    {
-        Tarray,     // slice array, aka T[]
-        Tsarray,    // static array, aka T[dimension]
-        Taarray,    // associative array, aka T[type]
-        Tpointer,
-        Treference,
-        Tfunction,
-        Tident,
-        Tclass,
-        Tstruct,
-        Tenum,
-
-        Tdelegate,
-        Tnone,
-        Tvoid,
-        Tint8,
-        Tuns8,
-        Tint16,
-        Tuns16,
-        Tint32,
-        Tuns32,
-        Tint64,
-
-        Tuns64,
-        Tfloat32,
-        Tfloat64,
-        Tfloat80,
-        Timaginary32,
-        Timaginary64,
-        Timaginary80,
-        Tcomplex32,
-        Tcomplex64,
-        Tcomplex80,
-
-        Tbool,
-        Tchar,
-        Twchar,
-        Tdchar,
-        Terror,
-        Tinstance,
-        Ttypeof,
-        Ttuple,
-        Tslice,
-        Treturn,
-
-        Tnull,
-        Tvector,
-        Tint128,
-        Tuns128,
-        Ttraits,
-        Tmixin,
-        TMAX
-    }
-
-    alias Tarray = ENUMTY.Tarray;
-    alias Tsarray = ENUMTY.Tsarray;
-    alias Taarray = ENUMTY.Taarray;
-    alias Tpointer = ENUMTY.Tpointer;
-    alias Treference = ENUMTY.Treference;
-    alias Tfunction = ENUMTY.Tfunction;
-    alias Tident = ENUMTY.Tident;
-    alias Tclass = ENUMTY.Tclass;
-    alias Tstruct = ENUMTY.Tstruct;
-    alias Tenum = ENUMTY.Tenum;
-    alias Tdelegate = ENUMTY.Tdelegate;
-    alias Tnone = ENUMTY.Tnone;
-    alias Tvoid = ENUMTY.Tvoid;
-    alias Tint8 = ENUMTY.Tint8;
-    alias Tuns8 = ENUMTY.Tuns8;
-    alias Tint16 = ENUMTY.Tint16;
-    alias Tuns16 = ENUMTY.Tuns16;
-    alias Tint32 = ENUMTY.Tint32;
-    alias Tuns32 = ENUMTY.Tuns32;
-    alias Tint64 = ENUMTY.Tint64;
-    alias Tuns64 = ENUMTY.Tuns64;
-    alias Tfloat32 = ENUMTY.Tfloat32;
-    alias Tfloat64 = ENUMTY.Tfloat64;
-    alias Tfloat80 = ENUMTY.Tfloat80;
-    alias Timaginary32 = ENUMTY.Timaginary32;
-    alias Timaginary64 = ENUMTY.Timaginary64;
-    alias Timaginary80 = ENUMTY.Timaginary80;
-    alias Tcomplex32 = ENUMTY.Tcomplex32;
-    alias Tcomplex64 = ENUMTY.Tcomplex64;
-    alias Tcomplex80 = ENUMTY.Tcomplex80;
-    alias Tbool = ENUMTY.Tbool;
-    alias Tchar = ENUMTY.Tchar;
-    alias Twchar = ENUMTY.Twchar;
-    alias Tdchar = ENUMTY.Tdchar;
-    alias Terror = ENUMTY.Terror;
-    alias Tinstance = ENUMTY.Tinstance;
-    alias Ttypeof = ENUMTY.Ttypeof;
-    alias Ttuple = ENUMTY.Ttuple;
-    alias Tslice = ENUMTY.Tslice;
-    alias Treturn = ENUMTY.Treturn;
-    alias Tnull = ENUMTY.Tnull;
-    alias Tvector = ENUMTY.Tvector;
-    alias Tint128 = ENUMTY.Tint128;
-    alias Tuns128 = ENUMTY.Tuns128;
-    alias Ttraits = ENUMTY.Ttraits;
-    alias Tmixin = ENUMTY.Tmixin;
-    alias TMAX = ENUMTY.TMAX;
-
-    alias TY = ubyte;
-
-    enum TFlags
-    {
-        integral     = 1,
-        floating     = 2,
-        unsigned     = 4,
-        real_        = 8,
-        imaginary    = 0x10,
-        complex      = 0x20,
-    }
-
-    enum PKG : int
-    {
-        unknown,     // not yet determined whether it's a package.d or not
-        module_,      // already determined that's an actual package.d
-        package_,     // already determined that's an actual package
-    }
-
-    enum StructPOD : int
-    {
-        no,    // struct is not POD
-        yes,   // struct is POD
-        fwd,   // POD not yet computed
-    }
-
-    enum TRUST : ubyte
-    {
-        default_   = 0,
-        system     = 1,    // @system (same as TRUST.default)
-        trusted    = 2,    // @trusted
-        safe       = 3,    // @safe
-        live       = 4,    // @live
-    }
-
-    enum PURE : ubyte
-    {
-        impure      = 0,    // not pure at all
-        fwdref      = 1,    // it's pure, but not known which level yet
-        weak        = 2,    // no mutable globals are read or written
-        const_      = 3,    // parameters are values or const
-        strong      = 4,    // parameters are values or immutable
-    }
-
-    enum AliasThisRec : int
-    {
-        no           = 0,    // no alias this recursion
-        yes          = 1,    // alias this has recursive dependency
-        fwdref       = 2,    // not yet known
-        typeMask     = 3,    // mask to read no/yes/fwdref
-        tracing      = 0x4,  // mark in progress of implicitConvTo/deduceWild
-        tracingDT    = 0x8,  // mark in progress of deduceType
-    }
-
-    enum VarArg : ubyte
-    {
-        none     = 0,  /// fixed number of arguments
-        variadic = 1,  /// T t, ...)  can be C-style (core.stdc.stdarg) or D-style (core.vararg)
-        typesafe = 2,  /// T t ...) typesafe https://dlang.org/spec/function.html#typesafe_variadic_functions
-                       ///   or https://dlang.org/spec/function.html#typesafe_variadic_functions
-    }
 
     alias Visitor = ParseTimeVisitor!ASTBase;
 
@@ -1560,7 +1306,7 @@ struct ASTBase
         {
             super(ident);
             this.arg = filename;
-            srcfile = FileName(FileName.defaultExt(filename.toDString, global.mars_ext));
+            srcfile = FileName(FileName.defaultExt(filename.toDString, mars_ext));
         }
 
         override void accept(Visitor v)
@@ -1957,49 +1703,6 @@ struct ASTBase
 
     }
 
-    enum STMT : ubyte
-    {
-        Error,
-        Peel,
-        Exp, DtorExp,
-        Compile,
-        Compound, CompoundDeclaration, CompoundAsm,
-        UnrolledLoop,
-        Scope,
-        Forwarding,
-        While,
-        Do,
-        For,
-        Foreach,
-        ForeachRange,
-        If,
-        Conditional,
-        StaticForeach,
-        Pragma,
-        StaticAssert,
-        Switch,
-        Case,
-        CaseRange,
-        Default,
-        GotoDefault,
-        GotoCase,
-        SwitchError,
-        Return,
-        Break,
-        Continue,
-        Synchronized,
-        With,
-        TryCatch,
-        TryFinally,
-        ScopeGuard,
-        Throw,
-        Debug,
-        Goto,
-        Label,
-        Asm, InlineAsm, GccAsm,
-        Import,
-    }
-
     extern (C++) abstract class Statement : ASTNode
     {
         Loc loc;
@@ -2019,6 +1722,9 @@ struct ASTBase
 
         nothrow pure @nogc
         inout(ReturnStatement) isReturnStatement() inout { return stmt == STMT.Return ? cast(typeof(return))this : null; }
+
+        nothrow pure @nogc
+        inout(BreakStatement) isBreakStatement() inout { return stmt == STMT.Break ? cast(typeof(return))this : null; }
 
         override void accept(Visitor v)
         {
@@ -2128,11 +1834,12 @@ struct ASTBase
 
     extern (C++) final class WhileStatement : Statement
     {
+        Parameter param;
         Expression condition;
         Statement _body;
         Loc endloc;
 
-        extern (D) this(const ref Loc loc, Expression c, Statement b, Loc endloc)
+        extern (D) this(const ref Loc loc, Expression c, Statement b, Loc endloc, Parameter param = null)
         {
             super(loc, STMT.While);
             condition = c;
@@ -2766,6 +2473,7 @@ struct ASTBase
         extern (C++) __gshared Type tdstring;    // immutable(dchar)[]
         extern (C++) __gshared Type terror;      // for error recovery
         extern (C++) __gshared Type tnull;       // for null type
+        extern (C++) __gshared Type tnoreturn;   // for bottom type
 
         extern (C++) __gshared Type tsize_t;     // matches size_t alias
         extern (C++) __gshared Type tptrdiff_t;  // matches ptrdiff_t alias
@@ -2814,6 +2522,8 @@ struct ASTBase
                 sizeTy[Tnull] = __traits(classInstanceSize, TypeNull);
                 sizeTy[Tvector] = __traits(classInstanceSize, TypeVector);
                 sizeTy[Tmixin] = __traits(classInstanceSize, TypeMixin);
+                sizeTy[Tnoreturn] = __traits(classInstanceSize, TypeNoreturn);
+                sizeTy[Ttag] = __traits(classInstanceSize, TypeTag);
                 return sizeTy;
             }();
 
@@ -2890,6 +2600,10 @@ struct ASTBase
             }
             basic[Terror] = new TypeError();
 
+            tnoreturn = new TypeNoreturn();
+            tnoreturn.deco = tnoreturn.merge().deco;
+            basic[Tnoreturn] = tnoreturn;
+
             tvoid = basic[Tvoid];
             tint8 = basic[Tint8];
             tuns8 = basic[Tuns8];
@@ -2920,6 +2634,7 @@ struct ASTBase
 
             tshiftcnt = tint32;
             terror = basic[Terror];
+            tnoreturn = basic[Tnoreturn];
             tnull = new TypeNull();
             tnull.deco = tnull.merge().deco;
 
@@ -2928,7 +2643,7 @@ struct ASTBase
             twstring = twchar.immutableOf().arrayOf();
             tdstring = tdchar.immutableOf().arrayOf();
 
-            const isLP64 = global.params.isLP64;
+            const isLP64 = Target.isLP64;
 
             tsize_t    = basic[isLP64 ? Tuns64 : Tuns32];
             tptrdiff_t = basic[isLP64 ? Tint64 : Tint32];
@@ -3574,6 +3289,7 @@ struct ASTBase
             inout(TypeNull)       isTypeNull()       { return ty == Tnull      ? cast(typeof(return))this : null; }
             inout(TypeMixin)      isTypeMixin()      { return ty == Tmixin     ? cast(typeof(return))this : null; }
             inout(TypeTraits)     isTypeTraits()     { return ty == Ttraits    ? cast(typeof(return))this : null; }
+            inout(TypeTag)        isTypeTag()        { return ty == Ttag       ? cast(typeof(return))this : null; }
         }
 
         override void accept(Visitor v)
@@ -3771,6 +3487,25 @@ struct ASTBase
         }
     }
 
+    extern (C++) final class TypeNoreturn : Type
+    {
+        extern (D) this()
+        {
+            super(Tnoreturn);
+        }
+
+        override TypeNoreturn syntaxCopy()
+        {
+            // No semantic analysis done, no need to copy
+            return this;
+        }
+
+        override void accept(Visitor v)
+        {
+            v.visit(this);
+        }
+    }
+
     extern (C++) class TypeVector : Type
     {
         Type basetype;
@@ -3891,6 +3626,36 @@ struct ASTBase
         }
 
         override TypeStruct syntaxCopy()
+        {
+            return this;
+        }
+
+        override void accept(Visitor v)
+        {
+            v.visit(this);
+        }
+    }
+
+    extern (C++) final class TypeTag : Type
+    {
+        Loc loc;
+        TOK tok;
+        Identifier id;
+        Dsymbols* members;
+
+        Type resolved;
+
+        extern (D) this(const ref Loc loc, TOK tok, Identifier id, Dsymbols* members)
+        {
+            //printf("TypeTag %p\n", this);
+            super(Ttag);
+            this.loc = loc;
+            this.tok = tok;
+            this.id = id;
+            this.members = members;
+        }
+
+        override TypeTag syntaxCopy()
         {
             return this;
         }
@@ -4683,6 +4448,13 @@ struct ASTBase
         override void accept(Visitor v)
         {
             v.visit(this);
+        }
+
+        extern (C++) final pure inout nothrow @nogc
+        {
+            inout(DeclarationExp) isDeclarationExp() { return op == TOK.declaration ? cast(typeof(return))this : null; }
+            inout(AssignExp) isConstructExp() { return op == TOK.construct ? cast(typeof(return))this : null; }
+            inout(AssignExp) isBlitExp()      { return op == TOK.blit ? cast(typeof(return))this : null; }
         }
     }
 
@@ -6433,15 +6205,6 @@ struct ASTBase
         }
     }
 
-    enum InitKind : ubyte
-    {
-        void_,
-        error,
-        struct_,
-        array,
-        exp,
-    }
-
     extern (C++) class Initializer : ASTNode
     {
         Loc loc;
@@ -6539,6 +6302,36 @@ struct ASTBase
         extern (D) this(const ref Loc loc)
         {
             super(loc, InitKind.void_);
+        }
+
+        override void accept(Visitor v)
+        {
+            v.visit(this);
+        }
+    }
+
+    struct Designator
+    {
+        Expression exp;         /// [ constant-expression ]
+        Identifier ident;       /// . identifier
+
+        this(Expression exp) { this.exp = exp; }
+        this(Identifier ident) { this.ident = ident; }
+    }
+
+    struct DesigInit
+    {
+        Designators* designatorList; /// designation (opt)
+        Initializer initializer;     /// initializer
+    }
+
+    extern (C++) final class CInitializer : Initializer
+    {
+        DesigInits initializerList; /// initializer-list
+
+        extern (D) this(const ref Loc loc)
+        {
+            super(loc, InitKind.C_);
         }
 
         override void accept(Visitor v)
@@ -6731,6 +6524,7 @@ struct ASTBase
             SCstring(STC.tls, "__thread"),
             SCstring(STC.gshared, Token.toString(TOK.gshared)),
             SCstring(STC.nogc, "@nogc"),
+            SCstring(STC.live, "@live"),
             SCstring(STC.property, "@property"),
             SCstring(STC.safe, "@safe"),
             SCstring(STC.trusted, "@trusted"),
@@ -6776,28 +6570,6 @@ struct ASTBase
     struct Target
     {
         extern (C++) __gshared int ptrsize;
-
-        extern (C++) static Type va_listType(const ref Loc loc, Scope* sc)
-        {
-            if (global.params.targetOS == TargetOS.Windows)
-            {
-                return Type.tchar.pointerTo();
-            }
-            else if (global.params.targetOS & TargetOS.Posix)
-            {
-                if (global.params.is64bit)
-                {
-                    return (new TypeIdentifier(Loc.initial, Identifier.idPool("__va_list_tag"))).pointerTo();
-                }
-                else
-                {
-                    return Type.tchar.pointerTo();
-                }
-            }
-            else
-            {
-                assert(0);
-            }
-        }
+        extern (C++) __gshared bool isLP64;
     }
 }

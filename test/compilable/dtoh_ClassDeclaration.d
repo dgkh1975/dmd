@@ -17,7 +17,7 @@ TEST_OUTPUT:
 #else
 /// Represents a D [] array
 template<typename T>
-struct _d_dynamicArray
+struct _d_dynamicArray final
 {
     size_t length;
     T *ptr;
@@ -38,10 +38,6 @@ struct _d_dynamicArray
     }
 };
 #endif
-
-class C;
-class A;
-struct Inner;
 
 class C
 {
@@ -90,7 +86,7 @@ public:
         int32_t u1;
         char u2[4$?:32=u|64=LLU$];
     };
-    struct Inner
+    struct Inner final
     {
         int32_t x;
         Inner() :
@@ -135,6 +131,7 @@ public:
 class B : public A, public I1, public I2
 {
 public:
+    using A::bar;
     void foo();
     void bar();
 };
@@ -151,6 +148,31 @@ class Child final : public Parent
 {
 public:
     void foo() /* const */;
+};
+
+class VisitorBase
+{
+public:
+    virtual void vir();
+    void stat();
+};
+
+class VisitorInter : public VisitorBase
+{
+public:
+    using VisitorBase::vir;
+    virtual void vir(int32_t i);
+    using VisitorBase::stat;
+    void stat(int32_t i);
+};
+
+class Visitor : public VisitorInter
+{
+public:
+    using VisitorInter::vir;
+    using VisitorInter::stat;
+    virtual void vir(bool b);
+    virtual void vir(char d);
 };
 ---
 +/
@@ -252,6 +274,7 @@ interface I2 : I1
 
 class B : A, I1, I2
 {
+    alias bar = A.bar;
     override void foo() {}
     override void bar() {}
 }
@@ -267,4 +290,37 @@ final class Child : Parent
 {
     extern(D) override void over() {}
     override void foo() const {}
+}
+
+class VisitorBase
+{
+    void vir() {}
+
+    final void stat() {}
+}
+
+class VisitorInter : VisitorBase
+{
+    alias vir = VisitorBase.vir;
+    void vir(int i) {}
+
+    alias stat = VisitorBase.stat;
+    final void stat(int i) {}
+}
+
+class Visitor : VisitorInter
+{
+    alias vir = VisitorInter.vir;
+
+    alias stat = VisitorInter.stat;
+
+    mixin Methods!() m;
+    alias vir = m.vir;
+}
+
+mixin template Methods()
+{
+    extern(C++) void vir(bool b) {}
+
+    extern(C++) void vir(char d) {}
 }

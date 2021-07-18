@@ -14,6 +14,7 @@
 module dmd.access;
 
 import dmd.aggregate;
+import dmd.astenums;
 import dmd.dclass;
 import dmd.declaration;
 import dmd.dmodule;
@@ -48,8 +49,16 @@ bool checkAccess(AggregateDeclaration ad, Loc loc, Scope* sc, Dsymbol smember)
         return false; // for backward compatibility
     }
 
-    if (!symbolIsVisible(sc, smember) && (!(sc.flags & SCOPE.onlysafeaccess) || sc.func.setUnsafe()))
+    if (!symbolIsVisible(sc, smember))
     {
+        // when in @safe code or with -preview=dip1000
+        if (sc.flags & SCOPE.onlysafeaccess)
+        {
+            // if there is a func. ask for it's opinion of safety, and if it considers the access @safe accept it.
+            if (sc.func && !sc.func.setUnsafe())
+                return false;
+        }
+
         ad.error(loc, "member `%s` is not accessible%s", smember.toChars(), (sc.flags & SCOPE.onlysafeaccess) ? " from `@safe` code".ptr : "".ptr);
         //printf("smember = %s %s, vis = %d, semanticRun = %d\n",
         //        smember.kind(), smember.toPrettyChars(), smember.visible() smember.semanticRun);
@@ -188,10 +197,10 @@ bool checkAccess(Loc loc, Scope* sc, Expression e, Dsymbol d)
     if (!e)
         return false;
 
-    if (e.type.ty == Tclass)
+    if (auto tc = e.type.isTypeClass())
     {
         // Do access check
-        ClassDeclaration cd = (cast(TypeClass)e.type).sym;
+        ClassDeclaration cd = tc.sym;
         if (e.op == TOK.super_)
         {
             if (ClassDeclaration cd2 = sc.func.toParent().isClassDeclaration())
@@ -199,10 +208,10 @@ bool checkAccess(Loc loc, Scope* sc, Expression e, Dsymbol d)
         }
         return checkAccess(cd, loc, sc, d);
     }
-    else if (e.type.ty == Tstruct)
+    else if (auto ts = e.type.isTypeStruct())
     {
         // Do access check
-        StructDeclaration cd = (cast(TypeStruct)e.type).sym;
+        StructDeclaration cd = ts.sym;
         return checkAccess(cd, loc, sc, d);
     }
     return false;

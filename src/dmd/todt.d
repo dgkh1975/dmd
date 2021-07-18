@@ -20,6 +20,7 @@ import dmd.root.rmem;
 
 import dmd.aggregate;
 import dmd.arraytypes;
+import dmd.astenums;
 import dmd.backend.type;
 import dmd.complex;
 import dmd.ctfeexpr;
@@ -33,6 +34,7 @@ import dmd.errors;
 import dmd.expression;
 import dmd.func;
 import dmd.globals;
+import dmd.glue;
 import dmd.init;
 import dmd.mtype;
 import dmd.target;
@@ -78,6 +80,9 @@ extern (C++) void Initializer_toDt(Initializer init, ref DtBuilder dtb)
 
     void visitStruct(StructInitializer si)
     {
+        /* The StructInitializer was converted to a StructLiteralExp,
+         * which is converted to dtb by membersToDt()
+         */
         //printf("StructInitializer.toDt('%s')\n", si.toChars());
         assert(0);
     }
@@ -196,6 +201,56 @@ extern (C++) void Initializer_toDt(Initializer init, ref DtBuilder dtb)
         Expression_toDt(ei.exp, dtb);
     }
 
+    void visitC(CInitializer ci)
+    {
+        //printf("CInitializer.toDt() (%s) %s\n", ci.type.toChars(), ci.toChars());
+
+        /* append all initializers to dtb
+         */
+        auto dil = ci.initializerList[];
+        size_t i = 0;
+
+        /* Support recursion to handle un-braced array initializers
+         * Params:
+         *    t = element type
+         *    dim = number of elements
+         */
+        void array(Type t, size_t dim)
+        {
+            //printf(" type %s i %d dim %d dil.length = %d\n", t.toChars(), cast(int)i, cast(int)dim, cast(int)dil.length);
+            auto tn = t.nextOf().toBasetype();
+            auto tnsa = tn.isTypeSArray();
+            const nelems = tnsa ? cast(size_t)tnsa.dim.toInteger() : 0;
+
+            foreach (j; 0 .. dim)
+            {
+                if (i == dil.length)
+                {
+                    if (j < dim)
+                    {   // Not enough initializers, fill in with 0
+                        const size = cast(uint)tn.size();
+                        dtb.nzeros(cast(uint)(size * (dim - j)));
+                    }
+                    break;
+                }
+                auto di = dil[i];
+                assert(!di.designatorList);
+                if (tnsa && di.initializer.isExpInitializer())
+                {
+                    // no braces enclosing array initializer, so recurse
+                    array(tnsa, nelems);
+                }
+                else
+                {
+                    ++i;
+                    Initializer_toDt(di.initializer, dtb);
+                }
+            }
+        }
+
+        array(ci.type, cast(size_t)ci.type.isTypeSArray().dim.toInteger());
+    }
+
     final switch (init.kind)
     {
         case InitKind.void_:   return visitVoid  (cast(  VoidInitializer)init);
@@ -203,6 +258,7 @@ extern (C++) void Initializer_toDt(Initializer init, ref DtBuilder dtb)
         case InitKind.struct_: return visitStruct(cast(StructInitializer)init);
         case InitKind.array:   return visitArray (cast( ArrayInitializer)init);
         case InitKind.exp:     return visitExp   (cast(   ExpInitializer)init);
+        case InitKind.C_:      return visitC     (cast(     CInitializer)init);
     }
 }
 
@@ -1197,7 +1253,7 @@ private extern (C++) class TypeInfoDtVisitor : Visitor
     override void visit(TypeInfoStructDeclaration d)
     {
         //printf("TypeInfoStructDeclaration.toDt() '%s'\n", d.toChars());
-        if (global.params.is64bit)
+        if (target.is64bit)
             verifyStructSize(Type.typeinfostruct, 17 * target.ptrsize);
         else
             verifyStructSize(Type.typeinfostruct, 15 * target.ptrsize);
@@ -1329,7 +1385,7 @@ private extern (C++) class TypeInfoDtVisitor : Visitor
         // uint m_align;
         dtb.size(tc.alignsize());
 
-        if (global.params.is64bit)
+        if (target.is64bit)
         {
             foreach (i; 0 .. 2)
             {

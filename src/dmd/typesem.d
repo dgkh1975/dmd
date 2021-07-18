@@ -21,6 +21,7 @@ import dmd.aliasthis;
 import dmd.arrayop;
 import dmd.arraytypes;
 import dmd.astcodegen;
+import dmd.astenums;
 import dmd.complex;
 import dmd.dcast;
 import dmd.dclass;
@@ -28,7 +29,7 @@ import dmd.declaration;
 import dmd.denum;
 import dmd.dimport;
 import dmd.dmangle;
-import dmd.dmodule : Module;
+import dmd.dmodule;
 import dmd.dscope;
 import dmd.dstruct;
 import dmd.dsymbol;
@@ -60,7 +61,6 @@ import dmd.semantic3;
 import dmd.sideeffect;
 import dmd.target;
 import dmd.tokens;
-import dmd.typesem;
 
 /**************************
  * This evaluates exp while setting length to be the number
@@ -75,6 +75,7 @@ private Expression semanticLength(Scope* sc, Type t, Expression exp)
         sc = sc.push(sym);
         sc = sc.startCTFE();
         exp = exp.expressionSemantic(sc);
+        exp = resolveProperties(sc, exp);
         sc = sc.endCTFE();
         sc.pop();
     }
@@ -82,6 +83,7 @@ private Expression semanticLength(Scope* sc, Type t, Expression exp)
     {
         sc = sc.startCTFE();
         exp = exp.expressionSemantic(sc);
+        exp = resolveProperties(sc, exp);
         sc = sc.endCTFE();
     }
     return exp;
@@ -95,6 +97,7 @@ private Expression semanticLength(Scope* sc, TupleDeclaration tup, Expression ex
     sc = sc.push(sym);
     sc = sc.startCTFE();
     exp = exp.expressionSemantic(sc);
+    exp = resolveProperties(sc, exp);
     sc = sc.endCTFE();
     sc.pop();
 
@@ -219,7 +222,10 @@ private void resolveHelper(TypeQualified mt, const ref Loc loc, Scope* sc, Dsymb
     else
     {
         // check for deprecated or disabled aliases
-        s.checkDeprecated(loc, sc);
+        // functions are checked after overloading
+        // templates are checked after matching constraints
+        if (!s.isFuncDeclaration() && !s.isTemplateDeclaration())
+            s.checkDeprecated(loc, sc);
         if (d)
             d.checkDisabled(loc, sc, true);
     }
@@ -255,10 +261,22 @@ private void resolveHelper(TypeQualified mt, const ref Loc loc, Scope* sc, Dsymb
         int flags = t is null ? SearchLocalsOnly : IgnorePrivateImports;
 
         Dsymbol sm = s.searchX(loc, sc, id, flags);
-        if (sm && !(sc.flags & SCOPE.ignoresymbolvisibility) && !symbolIsVisible(sc, sm))
+        if (sm)
         {
-            .error(loc, "`%s` is not visible from module `%s`", sm.toPrettyChars(), sc._module.toChars());
-            sm = null;
+            if (!(sc.flags & SCOPE.ignoresymbolvisibility) && !symbolIsVisible(sc, sm))
+            {
+                .error(loc, "`%s` is not visible from module `%s`", sm.toPrettyChars(), sc._module.toChars());
+                sm = null;
+            }
+            // Same check as in Expression.semanticY(DotIdExp)
+            else if (sm.isPackage() && checkAccess(sc, cast(Package)sm))
+            {
+                // @@@DEPRECATED_2.096@@@
+                // Should be an error in 2.106. Just remove the deprecation call
+                // and uncomment the null assignment
+                deprecation(loc, "%s %s is not accessible here, perhaps add 'static import %s;'", sm.kind(), sm.toPrettyChars(), sm.toPrettyChars());
+                //sm = null;
+            }
         }
         if (global.errors != errorsave)
         {
@@ -617,6 +635,7 @@ Expression typeToExpressionHelper(TypeQualified t, Expression e, size_t i = 0)
             case DYNCAST.statement:
             case DYNCAST.condition:
             case DYNCAST.templateparameter:
+            case DYNCAST.initializer:
                 assert(0);
         }
     }
@@ -730,17 +749,6 @@ extern(C++) Type typeSemantic(Type type, const ref Loc loc, Scope* sc)
         Type tbn = tn.toBasetype();
         if (mtype.dim)
         {
-            //https://issues.dlang.org/show_bug.cgi?id=15478
-            if (mtype.dim.isDotVarExp())
-            {
-                if (Declaration vd = mtype.dim.isDotVarExp().var)
-                {
-                    FuncDeclaration fd = vd.toAlias().isFuncDeclaration();
-                    if (fd)
-                        mtype.dim = new CallExp(loc, fd, null);
-                }
-            }
-
             auto errors = global.errors;
             mtype.dim = semanticLength(sc, tbn, mtype.dim);
             if (errors != global.errors)
@@ -893,12 +901,9 @@ extern(C++) Type typeSemantic(Type type, const ref Loc loc, Scope* sc)
             Dsymbol s;
             mtype.index.resolve(loc, sc, e, t, s);
 
-            //https://issues.dlang.org/show_bug.cgi?id=15478
+            // https://issues.dlang.org/show_bug.cgi?id=15478
             if (s)
-            {
-                if (FuncDeclaration fd = s.toAlias().isFuncDeclaration())
-                    e = new CallExp(loc, fd, null);
-            }
+                e = symbolToExp(s, loc, sc, false);
 
             if (e)
             {
@@ -963,13 +968,15 @@ extern(C++) Type typeSemantic(Type type, const ref Loc loc, Scope* sc)
 
             // duplicate a part of StructDeclaration::semanticTypeInfoMembers
             //printf("AA = %s, key: xeq = %p, xerreq = %p xhash = %p\n", toChars(), sd.xeq, sd.xerreq, sd.xhash);
-            if (sd.xeq && sd.xeq._scope && sd.xeq.semanticRun < PASS.semantic3done)
+
+            if (sd.xeq && sd.xeq.generated && sd.xeq._scope && sd.xeq.semanticRun < PASS.semantic3done)
             {
                 uint errors = global.startGagging();
                 sd.xeq.semantic3(sd.xeq._scope);
                 if (global.endGagging(errors))
                     sd.xeq = sd.xerreq;
             }
+
 
             //printf("AA = %s, key: xeq = %p, xhash = %p\n", toChars(), sd.xeq, sd.xhash);
             const(char)* s = (mtype.index.toBasetype().ty != Tstruct) ? "bottom of " : "";
@@ -1285,7 +1292,8 @@ extern(C++) Type typeSemantic(Type type, const ref Loc loc, Scope* sc)
 
             // default arg must be an lvalue
             if (isRefOrOut && !isAuto &&
-                !(global.params.previewIn && (fparam.storageClass & STC.in_)))
+                !(global.params.previewIn && (fparam.storageClass & STC.in_)) &&
+                !(global.params.rvalueRefParam))
                 e = e.toLvalue(sc, e);
 
             fparam.defaultArg = e;
@@ -1750,6 +1758,7 @@ extern(C++) Type typeSemantic(Type type, const ref Loc loc, Scope* sc)
             mtype.exp.ident != Id.getMember &&
             mtype.exp.ident != Id.parent &&
             mtype.exp.ident != Id.child &&
+            mtype.exp.ident != Id.toType &&
             mtype.exp.ident != Id.getOverloads &&
             mtype.exp.ident != Id.getVirtualFunctions &&
             mtype.exp.ident != Id.getVirtualMethods &&
@@ -1977,6 +1986,176 @@ extern(C++) Type typeSemantic(Type type, const ref Loc loc, Scope* sc)
         return error();
     }
 
+    Type visitTag(TypeTag mtype)
+    {
+        //printf("TypeTag.semantic() %s\n", mtype.toChars());
+        if (mtype.resolved)
+        {
+            /* struct S s, *p;
+             */
+            //printf("already resolved\n");
+            return mtype.resolved;
+        }
+
+        /* Declare mtype as a struct/union/enum declaration
+         */
+        void declareTag()
+        {
+            void declare(ScopeDsymbol sd)
+            {
+                sd.members = mtype.members;
+                auto scopesym = sc.inner().scopesym;
+                if (scopesym.members)
+                    scopesym.members.push(sd);
+                if (scopesym.symtab && !scopesym.symtabInsert(sd))
+                {
+                    Dsymbol s2 = scopesym.symtabLookup(sd, mtype.id);
+                    handleTagSymbols(*sc, sd, s2, scopesym);
+                }
+                sd.parent = sc.parent;
+                sd.dsymbolSemantic(sc);
+            }
+
+            switch (mtype.tok)
+            {
+                case TOK.enum_:
+                    auto ed = new EnumDeclaration(mtype.loc, mtype.id, Type.tint32);
+                    declare(ed);
+                    mtype.resolved = visitEnum(new TypeEnum(ed));
+                    break;
+
+                case TOK.struct_:
+                    auto sd = new StructDeclaration(mtype.loc, mtype.id, false);
+                    declare(sd);
+                    mtype.resolved = visitStruct(new TypeStruct(sd));
+                    break;
+
+                case TOK.union_:
+                    auto ud = new UnionDeclaration(mtype.loc, mtype.id);
+                    declare(ud);
+                    mtype.resolved = visitStruct(new TypeStruct(ud));
+                    break;
+
+                default:
+                    assert(0);
+            }
+        }
+
+        /* If it doesn't have a tag by now, supply one.
+         * It'll be unique, and therefore introducing.
+         * Declare it, and done.
+         */
+        if (!mtype.id)
+        {
+            mtype.id = Identifier.generateId("__tag"[]);
+            declareTag();
+            return mtype.resolved;
+        }
+
+        /* look for pre-existing declaration
+         */
+        Dsymbol scopesym;
+        auto s = sc.search(mtype.loc, mtype.id, &scopesym, IgnoreErrors | TagNameSpace);
+        if (!s)
+        {
+            // no pre-existing declaration, so declare it
+            if (mtype.tok == TOK.enum_ && !mtype.members)
+                .error(mtype.loc, "`enum %s` is incomplete without members", mtype.id.toChars()); // C11 6.7.2.3-3
+            declareTag();
+            return mtype.resolved;
+        }
+
+        /* A redeclaration only happens if both declarations are in
+         * the same scope
+         */
+        const bool redeclar = (scopesym == sc.inner().scopesym);
+
+        if (redeclar)
+        {
+            if (mtype.tok == TOK.enum_ && s.isEnumDeclaration())
+            {
+                auto ed = s.isEnumDeclaration();
+                if (mtype.members && ed.members)
+                    .error(mtype.loc, "`%s` already has members", mtype.id.toChars());
+                else if (!ed.members)
+                {
+                    ed.members = mtype.members;
+                }
+                else
+                {
+                }
+                mtype.resolved = ed.type;
+            }
+            else if (mtype.tok == TOK.union_ && s.isUnionDeclaration() ||
+                     mtype.tok == TOK.struct_ && s.isStructDeclaration())
+            {
+                // Add members to original declaration
+                auto sd = s.isStructDeclaration();
+                if (mtype.members && sd.members)
+                {
+                    /* struct S { int b; };
+                     * struct S { int a; } *s;
+                     */
+                    .error(mtype.loc, "`%s` already has members", mtype.id.toChars());
+                }
+                else if (!sd.members)
+                {
+                    /* struct S;
+                     * struct S { int a; } *s;
+                     */
+                    sd.members = mtype.members;
+                }
+                else
+                {
+                    /* struct S { int a; };
+                     * struct S *s;
+                     */
+                }
+                mtype.resolved = sd.type;
+            }
+            else
+            {
+                /* int S;
+                 * struct S { int a; } *s;
+                 */
+                .error(mtype.loc, "redeclaration of `%s`", mtype.id.toChars());
+                mtype.resolved = error();
+            }
+        }
+        else if (mtype.members)
+        {
+            /* struct S;
+             * { struct S { int a; } *s; }
+             */
+            declareTag();
+        }
+        else
+        {
+            if (mtype.tok == TOK.enum_ && s.isEnumDeclaration())
+            {
+                mtype.resolved = s.isEnumDeclaration().type;
+            }
+            else if (mtype.tok == TOK.union_ && s.isUnionDeclaration() ||
+                     mtype.tok == TOK.struct_ && s.isStructDeclaration())
+            {
+                /* struct S;
+                 * { struct S *s; }
+                 */
+                mtype.resolved = s.isStructDeclaration().type;
+            }
+            else
+            {
+                /* union S;
+                 * { struct S *s; }
+                 */
+                .error(mtype.loc, "redeclaring `%s %s` as `%s %s`",
+                    s.kind(), s.toChars(), Token.toChars(mtype.tok), mtype.id.toChars());
+                declareTag();
+            }
+        }
+        return mtype.resolved;
+    }
+
     switch (type.ty)
     {
         default:         return visitType(type);
@@ -1999,6 +2178,7 @@ extern(C++) Type typeSemantic(Type type, const ref Loc loc, Scope* sc)
         case Ttuple:     return visitTuple (cast(TypeTuple)type);
         case Tslice:     return visitSlice(cast(TypeSlice)type);
         case Tmixin:     return visitMixin(cast(TypeMixin)type);
+        case Ttag:       return visitTag(cast(TypeTag)type);
     }
 }
 
@@ -2202,17 +2382,22 @@ Expression getProperty(Type t, Scope* scope_, const ref Loc loc, Identifier iden
             {
                 if (s)
                     error(loc, "no property `%s` for type `%s`, did you mean `%s`?", ident.toChars(), mt.toChars(), s.toPrettyChars());
+                else if (ident == Id.call && mt.ty == Tclass)
+                    error(loc, "no property `%s` for type `%s`, did you mean `new %s`?", ident.toChars(), mt.toChars(), mt.toPrettyChars());
+
+                else if (const n = importHint(ident.toString()))
+                        error(loc, "no property `%s` for type `%s`, perhaps `import %.*s;` is needed?", ident.toChars(), mt.toChars(), cast(int)n.length, n.ptr);
                 else
                 {
-                    if (ident == Id.call && mt.ty == Tclass)
-                        error(loc, "no property `%s` for type `%s`, did you mean `new %s`?", ident.toChars(), mt.toChars(), mt.toPrettyChars());
-                    else
-                    {
-                        if (const n = importHint(ident.toString()))
-                            error(loc, "no property `%s` for type `%s`, perhaps `import %.*s;` is needed?", ident.toChars(), mt.toChars(), cast(int)n.length, n.ptr);
-                        else
-                            error(loc, "no property `%s` for type `%s`", ident.toChars(), mt.toPrettyChars(true));
-                    }
+                    error(loc, "no property `%s` for type `%s`", ident.toChars(), mt.toPrettyChars(true));
+                    if (auto dsym = mt.toDsymbol(scope_))
+                        if (auto sym = dsym.isAggregateDeclaration())
+                        {
+                            if (auto fd = search_function(sym, Id.opDispatch))
+                                errorSupplemental(loc, "potentially malformed `opDispatch`. Use an explicit instantiation to get a better error message");
+                            else if (!sym.members)
+                                errorSupplemental(sym.loc, "`%s %s` is opaque and has no members.", sym.kind, mt.toPrettyChars(true));
+                        }
                 }
             }
             e = ErrorExp.get();
@@ -3554,7 +3739,11 @@ Expression dotExp(Type mt, Scope* sc, Expression e, Identifier ident, int flag)
         assert(mt.ty == Tstruct || mt.ty == Tclass);
         auto sym = mt.toDsymbol(sc).isAggregateDeclaration();
         assert(sym);
-        if (ident != Id.__sizeof &&
+        if (// https://issues.dlang.org/show_bug.cgi?id=22054
+            // if a class or struct does not have a body
+            // there is no point in searching for its members
+            sym.members &&
+            ident != Id.__sizeof &&
             ident != Id.__xalignof &&
             ident != Id._init &&
             ident != Id._mangleof &&
@@ -3695,7 +3884,7 @@ Expression dotExp(Type mt, Scope* sc, Expression e, Identifier ident, int flag)
 
             e = new TupleExp(e.loc, e0, exps);
             Scope* sc2 = sc.push();
-            sc2.flags |= global.params.vsafe ? SCOPE.onlysafeaccess : SCOPE.noaccesscheck;
+            sc2.flags |= global.params.useDIP1000 == FeatureState.enabled ? SCOPE.onlysafeaccess : SCOPE.noaccesscheck;
             e = e.expressionSemantic(sc2);
             sc2.pop();
             return e;
@@ -3761,9 +3950,7 @@ Expression dotExp(Type mt, Scope* sc, Expression e, Identifier ident, int flag)
         TemplateMixin tm = s.isTemplateMixin();
         if (tm)
         {
-            Expression de = new DotExp(e.loc, e, new ScopeExp(e.loc, tm));
-            de.type = e.type;
-            return de;
+            return new DotExp(e.loc, e, new ScopeExp(e.loc, tm)).expressionSemantic(sc);
         }
 
         TemplateDeclaration td = s.isTemplateDeclaration();
@@ -3878,23 +4065,6 @@ Expression dotExp(Type mt, Scope* sc, Expression e, Identifier ident, int flag)
 
         if (mt.sym.semanticRun < PASS.semanticdone)
             mt.sym.dsymbolSemantic(null);
-        if (!mt.sym.members)
-        {
-            if (mt.sym.isSpecial())
-            {
-                /* Special enums forward to the base type
-                 */
-                e = mt.sym.memtype.dotExp(sc, e, ident, flag);
-            }
-            else if (!(flag & 1))
-            {
-                mt.sym.error("is forward referenced when looking for `%s`", ident.toChars());
-                e = ErrorExp.get();
-            }
-            else
-                e = null;
-            return e;
-        }
 
         Dsymbol s = mt.sym.search(e.loc, ident);
         if (!s)
@@ -3975,7 +4145,7 @@ Expression dotExp(Type mt, Scope* sc, Expression e, Identifier ident, int flag)
 
             e = new TupleExp(e.loc, e0, exps);
             Scope* sc2 = sc.push();
-            sc2.flags |= global.params.vsafe ? SCOPE.onlysafeaccess : SCOPE.noaccesscheck;
+            sc2.flags |= global.params.useDIP1000 == FeatureState.enabled ? SCOPE.onlysafeaccess : SCOPE.noaccesscheck;
             e = e.expressionSemantic(sc2);
             sc2.pop();
             return e;
@@ -4188,9 +4358,7 @@ Expression dotExp(Type mt, Scope* sc, Expression e, Identifier ident, int flag)
         TemplateMixin tm = s.isTemplateMixin();
         if (tm)
         {
-            Expression de = new DotExp(e.loc, e, new ScopeExp(e.loc, tm));
-            de.type = e.type;
-            return de;
+            return new DotExp(e.loc, e, new ScopeExp(e.loc, tm)).expressionSemantic(sc);
         }
 
         TemplateDeclaration td = s.isTemplateDeclaration();
@@ -4544,6 +4712,19 @@ Expression defaultInit(Type mt, const ref Loc loc)
         return new TupleExp(loc, exps);
     }
 
+    Expression visitNoreturn(TypeNoreturn mt)
+    {
+        static if (LOGDEFAULTINIT)
+        {
+            printf("TypeNoreturn::defaultInit() '%s'\n", mt.toChars());
+        }
+        auto cond = IntegerExp.createBool(false);
+        auto msg = new StringExp(loc, "Accessed expression of type `noreturn`");
+        auto ae = new AssertExp(loc, cond, msg);
+        ae.type = mt;
+        return ae;
+    }
+
     switch (mt.ty)
     {
         case Tvector:   return visitVector  (cast(TypeVector)mt);
@@ -4563,9 +4744,129 @@ Expression defaultInit(Type mt, const ref Loc loc)
         case Treference:
         case Tdelegate:
         case Tclass:    return new NullExp(loc, mt);
+        case Tnoreturn: return visitNoreturn(cast(TypeNoreturn) mt);
 
         default:        return mt.isTypeBasic() ?
                                 visitBasic(cast(TypeBasic)mt) :
                                 null;
     }
+}
+
+
+/******************************
+ * Get the value of the .max/.min property of `ed` as an Expression.
+ * Lazily computes the value and caches it in maxval/minval.
+ * Reports any errors.
+ * Params:
+ *      ed = the EnumDeclaration being examined
+ *      loc = location to use for error messages
+ *      id = Id::max or Id::min
+ * Returns:
+ *      corresponding value of .max/.min
+ */
+private Expression getMaxMinValue(EnumDeclaration ed, const ref Loc loc, Identifier id)
+{
+    //printf("EnumDeclaration::getMaxValue()\n");
+
+    static Expression pvalToResult(Expression e, const ref Loc loc)
+    {
+        if (e.op != TOK.error)
+        {
+            e = e.copy();
+            e.loc = loc;
+        }
+        return e;
+    }
+
+    Expression* pval = (id == Id.max) ? &ed.maxval : &ed.minval;
+
+    Expression errorReturn()
+    {
+        *pval = ErrorExp.get();
+        return *pval;
+    }
+
+    if (ed.inuse)
+    {
+        ed.error(loc, "recursive definition of `.%s` property", id.toChars());
+        return errorReturn();
+    }
+    if (*pval)
+        return pvalToResult(*pval, loc);
+
+    if (ed._scope)
+        dsymbolSemantic(ed, ed._scope);
+    if (ed.errors)
+        return errorReturn();
+    if (!ed.members)
+    {
+        if (ed.isSpecial())
+        {
+            /* Allow these special enums to not need a member list
+             */
+            return ed.memtype.getProperty(ed._scope, loc, id, 0);
+        }
+
+        ed.error(loc, "is opaque and has no `.%s`", id.toChars());
+        return errorReturn();
+    }
+    if (!(ed.memtype && ed.memtype.isintegral()))
+    {
+        ed.error(loc, "has no `.%s` property because base type `%s` is not an integral type",
+              id.toChars(), ed.memtype ? ed.memtype.toChars() : "");
+        return errorReturn();
+    }
+
+    bool first = true;
+    for (size_t i = 0; i < ed.members.dim; i++)
+    {
+        EnumMember em = (*ed.members)[i].isEnumMember();
+        if (!em)
+            continue;
+        if (em.errors)
+        {
+            ed.errors = true;
+            continue;
+        }
+
+        if (em.semanticRun < PASS.semanticdone)
+        {
+            em.error("is forward referenced looking for `.%s`", id.toChars());
+            ed.errors = true;
+            continue;
+        }
+
+        if (first)
+        {
+            *pval = em.value;
+            first = false;
+        }
+        else
+        {
+            /* In order to work successfully with UDTs,
+             * build expressions to do the comparisons,
+             * and let the semantic analyzer and constant
+             * folder give us the result.
+             */
+
+            /* Compute:
+             *   if (e > maxval)
+             *      maxval = e;
+             */
+            Expression e = em.value;
+            Expression ec = new CmpExp(id == Id.max ? TOK.greaterThan : TOK.lessThan, em.loc, e, *pval);
+            ed.inuse++;
+            ec = ec.expressionSemantic(em._scope);
+            ed.inuse--;
+            ec = ec.ctfeInterpret();
+            if (ec.op == TOK.error)
+            {
+                ed.errors = true;
+                continue;
+            }
+            if (ec.toInteger())
+                *pval = e;
+        }
+    }
+    return ed.errors ? errorReturn() : pvalToResult(*pval, loc);
 }

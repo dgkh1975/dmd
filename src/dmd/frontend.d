@@ -120,10 +120,10 @@ void initDMD(
     import dmd.globals : CHECKENABLE, global;
     import dmd.id : Id;
     import dmd.identifier : Identifier;
-    import dmd.mars : setTarget, addDefaultVersionIdentifiers;
+    import dmd.mars : addDefaultVersionIdentifiers;
     import dmd.mtype : Type;
     import dmd.objc : Objc;
-    import dmd.target : target;
+    import dmd.target : target, defaultTargetOS;
 
     diagnosticHandler = handler;
 
@@ -140,16 +140,17 @@ void initDMD(
     }
 
     versionIdentifiers.each!(VersionCondition.addGlobalIdent);
-    setTarget(global.params);
-    addDefaultVersionIdentifiers(global.params);
 
+    target.os = defaultTargetOS();
+    target._init(global.params);
     Type._init();
     Id.initialize();
     Module._init();
-    target._init(global.params);
     Expression._init();
     Objc._init();
     FileCache._init();
+
+    addDefaultVersionIdentifiers(global.params, target);
 
     version (CRuntime_Microsoft)
         initFPU();
@@ -447,7 +448,8 @@ string prettyPrint(Module m)
     import dmd.root.outbuffer: OutBuffer;
     import dmd.hdrgen : HdrGenState, moduleToBuffer2;
 
-    OutBuffer buf = { doindent: 1 };
+    auto buf = OutBuffer();
+    buf.doindent = 1;
     HdrGenState hgs = { fullDump: 1 };
     moduleToBuffer2(m, &buf, &hgs);
 

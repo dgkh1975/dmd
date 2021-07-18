@@ -19,6 +19,7 @@ import core.stdc.string;
 import dmd.aggregate;
 import dmd.aliasthis;
 import dmd.arraytypes;
+import dmd.astenums;
 import dmd.attrib;
 import dmd.complex;
 import dmd.cond;
@@ -250,6 +251,20 @@ public:
     override void visit(WhileStatement s)
     {
         buf.writestring("while (");
+        if (auto p = s.param)
+        {
+            // Print condition assignment
+            StorageClass stc = p.storageClass;
+            if (!p.type && !stc)
+                stc = STC.auto_;
+            if (stcToBuffer(buf, stc))
+                buf.writeByte(' ');
+            if (p.type)
+                typeToBuffer(p.type, p.ident, buf, hgs);
+            else
+                buf.writestring(p.ident.toString());
+            buf.writestring(" = ");
+        }
         s.condition.expressionToBuffer(buf, hgs);
         buf.writeByte(')');
         buf.writenl();
@@ -734,8 +749,8 @@ public:
                 t.value != TOK.comma    && t.next.value != TOK.comma    &&
                 t.value != TOK.leftBracket && t.next.value != TOK.leftBracket &&
                                           t.next.value != TOK.rightBracket &&
-                t.value != TOK.leftParentheses   && t.next.value != TOK.leftParentheses   &&
-                                          t.next.value != TOK.rightParentheses   &&
+                t.value != TOK.leftParenthesis   && t.next.value != TOK.leftParenthesis   &&
+                                          t.next.value != TOK.rightParenthesis   &&
                 t.value != TOK.dot      && t.next.value != TOK.dot)
             {
                 buf.writeByte(' ');
@@ -900,9 +915,7 @@ public:
             buf.writenl();
             return;
         }
-        if (d.decl.dim == 0)
-            buf.writestring("{}");
-        else if (hgs.hdrgen && d.decl.dim == 1 && (*d.decl)[0].isUnitTestDeclaration())
+        if (d.decl.dim == 0 || (hgs.hdrgen && d.decl.dim == 1 && (*d.decl)[0].isUnitTestDeclaration()))
         {
             // hack for bugzilla 8081
             buf.writestring("{}");
@@ -984,7 +997,13 @@ public:
     {
         buf.writestring("align ");
         if (d.ealign)
-            buf.printf("(%s) ", d.ealign.toChars());
+        {
+            buf.printf("(%s)", d.ealign.toChars());
+            AttribDeclaration ad = cast(AttribDeclaration)d;
+            if (ad.decl && ad.decl.dim < 2)
+                buf.writeByte(' ');
+        }
+
         visit(cast(AttribDeclaration)d);
     }
 
@@ -1670,6 +1689,8 @@ public:
             buf.writestring("@safe ");
         if (d.storage_class & STC.nogc)
             buf.writestring("@nogc ");
+        if (d.storage_class & STC.live)
+            buf.writestring("@live ");
         if (d.storage_class & STC.disable)
             buf.writestring("@disable ");
 
@@ -1860,8 +1881,16 @@ public:
                 buf.writeByte(')');
                 if (target.ptrsize == 8)
                     goto case Tuns64;
-                else
+                else if (target.ptrsize == 4 ||
+                         target.ptrsize == 2)
                     goto case Tuns32;
+                else
+                    assert(0);
+
+            case Tvoid:
+                buf.writestring("cast(void)0");
+                break;
+
             default:
                 /* This can happen if errors, such as
                  * the type is painted on like in fromConstInitializer().
@@ -2014,6 +2043,14 @@ public:
             e.stageflags = old;
         }
         buf.writeByte(')');
+    }
+
+    override void visit(CompoundLiteralExp e)
+    {
+        buf.writeByte('(');
+        typeToBuffer(e.type, null, buf, hgs);
+        buf.writeByte(')');
+        e.initializer.initializerToBuffer(buf, hgs);
     }
 
     override void visit(TypeExp e)
@@ -2791,6 +2828,7 @@ string stcToString(ref StorageClass stc)
         SCstring(STC.tls, "__thread"),
         SCstring(STC.gshared, Token.toString(TOK.gshared)),
         SCstring(STC.nogc, "@nogc"),
+        SCstring(STC.live, "@live"),
         SCstring(STC.property, "@property"),
         SCstring(STC.safe, "@safe"),
         SCstring(STC.trusted, "@trusted"),
@@ -3580,6 +3618,36 @@ private void initializerToBuffer(Initializer inx, OutBuffer* buf, HdrGenState* h
         ei.exp.expressionToBuffer(buf, hgs);
     }
 
+    void visitC(CInitializer ci)
+    {
+        buf.writeByte('{');
+        foreach (i, ref DesigInit di; ci.initializerList)
+        {
+            if (i)
+                buf.writestring(", ");
+            if (di.designatorList)
+            {
+                foreach (ref Designator d; (*di.designatorList)[])
+                {
+                    if (d.exp)
+                    {
+                        buf.writeByte('[');
+                        toCBuffer(d.exp, buf, hgs);
+                        buf.writeByte(']');
+                    }
+                    else
+                    {
+                        buf.writeByte('.');
+                        buf.writestring(d.ident.toString());
+                    }
+                }
+                buf.writeByte('=');
+            }
+            initializerToBuffer(di.initializer, buf, hgs);
+        }
+        buf.writeByte('}');
+    }
+
     final switch (inx.kind)
     {
         case InitKind.error:   return visitError (inx.isErrorInitializer ());
@@ -3587,6 +3655,7 @@ private void initializerToBuffer(Initializer inx, OutBuffer* buf, HdrGenState* h
         case InitKind.struct_: return visitStruct(inx.isStructInitializer());
         case InitKind.array:   return visitArray (inx.isArrayInitializer ());
         case InitKind.exp:     return visitExp   (inx.isExpInitializer   ());
+        case InitKind.C_:      return visitC     (inx.isCInitializer     ());
     }
 }
 
@@ -3766,11 +3835,19 @@ private void typeToBufferx(Type t, OutBuffer* buf, HdrGenState* hgs)
         // https://issues.dlang.org/show_bug.cgi?id=13776
         // Don't use ti.toAlias() to avoid forward reference error
         // while printing messages.
-        TemplateInstance ti = t.sym.parent.isTemplateInstance();
+        TemplateInstance ti = t.sym.parent ? t.sym.parent.isTemplateInstance() : null;
         if (ti && ti.aliasdecl == t.sym)
             buf.writestring(hgs.fullQual ? ti.toPrettyChars() : ti.toChars());
         else
             buf.writestring(hgs.fullQual ? t.sym.toPrettyChars() : t.sym.toChars());
+    }
+
+    void visitTag(TypeTag t)
+    {
+        buf.writestring(Token.toChars(t.tok));
+        buf.writeByte(' ');
+        if (t.id)
+            buf.writestring(t.id.toChars());
     }
 
     void visitTuple(TypeTuple t)
@@ -3800,6 +3877,12 @@ private void typeToBufferx(Type t, OutBuffer* buf, HdrGenState* hgs)
         buf.writeByte(')');
     }
 
+    void visitNoreturn(TypeNoreturn t)
+    {
+        buf.writestring("noreturn");
+    }
+
+
     switch (t.ty)
     {
         default:        return t.isTypeBasic() ?
@@ -3827,5 +3910,7 @@ private void typeToBufferx(Type t, OutBuffer* buf, HdrGenState* hgs)
         case Tslice:     return visitSlice(cast(TypeSlice)t);
         case Tnull:      return visitNull(cast(TypeNull)t);
         case Tmixin:     return visitMixin(cast(TypeMixin)t);
+        case Tnoreturn:  return visitNoreturn(cast(TypeNoreturn)t);
+        case Ttag:       return visitTag(cast(TypeTag)t);
     }
 }

@@ -23,13 +23,13 @@ import dmd.root.outbuffer;
 import dmd.root.rmem;
 import dmd.utf;
 
-enum TOK : ubyte
+enum TOK : ushort
 {
     reserved,
 
     // Other
-    leftParentheses,
-    rightParentheses,
+    leftParenthesis,
+    rightParenthesis,
     leftBracket,
     rightBracket,
     leftCurly,
@@ -268,9 +268,9 @@ enum TOK : ubyte
     line,
     file,
     fileFullPath,
-    moduleString,
-    functionString,
-    prettyFunction,
+    moduleString,   // __MODULE__
+    functionString, // __FUNCTION__
+    prettyFunction, // __PRETTY_FUNCTION__
     shared_,
     at,
     pow,
@@ -287,8 +287,38 @@ enum TOK : ubyte
     objcClassReference,
     vectorArray,
 
-    max_,
+    arrow,      // ->
+    colonColon, // ::
+    wchar_tLiteral,
+    compoundLiteral, // ( type-name ) { initializer-list }
+
+    // C only keywords
+    inline,
+    register,
+    restrict,
+    signed,
+    sizeof_,
+    typedef_,
+    unsigned,
+    volatile,
+    _Alignas,
+    _Alignof,
+    _Atomic,
+    _Bool,
+    _Complex,
+    _Generic,
+    _Imaginary,
+    _Noreturn,
+    _Static_assert,
+    _Thread_local,
+
+    // C only extended keywords
+    __cdecl,
+    __declspec,
+    __attribute__,
 }
+
+enum FirstCKeyword = TOK.inline;
 
 // Assert that all token enum members have consecutive values and
 // that none of them overlap
@@ -301,7 +331,6 @@ static assert(() {
     }
     return true;
 }());
-
 
 /****************************************
  */
@@ -419,6 +448,31 @@ private immutable TOK[] keywords =
     TOK.prettyFunction,
     TOK.shared_,
     TOK.immutable_,
+
+    // C only keywords
+    TOK.inline,
+    TOK.register,
+    TOK.restrict,
+    TOK.signed,
+    TOK.sizeof_,
+    TOK.typedef_,
+    TOK.unsigned,
+    TOK.volatile,
+    TOK._Alignas,
+    TOK._Alignof,
+    TOK._Atomic,
+    TOK._Bool,
+    TOK._Complex,
+    TOK._Generic,
+    TOK._Imaginary,
+    TOK._Noreturn,
+    TOK._Static_assert,
+    TOK._Thread_local,
+
+    // C only extended keywords
+    TOK.__cdecl,
+    TOK.__declspec,
+    TOK.__attribute__,
 ];
 
 // Initialize the identifier pool
@@ -431,6 +485,30 @@ shared static this() nothrow
         Identifier.idPool(Token.tochars[kw].ptr, Token.tochars[kw].length, cast(uint)kw);
     }
 }
+
+/************************************
+ * This is used to pick the C keywords out of the tokens.
+ * If it's not a C keyword, then it's an identifier.
+ */
+static immutable TOK[TOK.max + 1] Ckeywords =
+() {
+    with (TOK)
+    {
+        TOK[TOK.max + 1] tab = identifier;  // default to identifier
+        enum Ckwds = [ auto_, break_, case_, char_, const_, continue_, default_, do_, float64, else_,
+                       enum_, extern_, float32, for_, goto_, if_, inline, int32, int64, register,
+                       restrict, return_, int16, signed, sizeof_, static_, struct_, switch_, typedef_,
+                       union_, unsigned, void_, volatile, while_, asm_,
+                       _Alignas, _Alignof, _Atomic, _Bool, _Complex, _Generic, _Imaginary, _Noreturn,
+                       _Static_assert, _Thread_local, __cdecl, __declspec, __attribute__ ];
+
+        foreach (kw; Ckwds)
+            tab[kw] = cast(TOK) kw;
+
+        return tab;
+    }
+} ();
+
 
 /***********************************************************
  */
@@ -461,7 +539,7 @@ extern (C++) struct Token
         Identifier ident;
     }
 
-    extern (D) private static immutable string[TOK.max_] tochars =
+    extern (D) private static immutable string[TOK.max + 1] tochars =
     [
         // Keywords
         TOK.this_: "this",
@@ -579,8 +657,8 @@ extern (C++) struct Token
         TOK.endOfFile: "End of File",
         TOK.leftCurly: "{",
         TOK.rightCurly: "}",
-        TOK.leftParentheses: "(",
-        TOK.rightParentheses: ")",
+        TOK.leftParenthesis: "(",
+        TOK.rightParenthesis: ")",
         TOK.leftBracket: "[",
         TOK.rightBracket: "]",
         TOK.semicolon: ";",
@@ -651,6 +729,8 @@ extern (C++) struct Token
         TOK.powAssign: "^^=",
         TOK.goesTo: "=>",
         TOK.pound: "#",
+        TOK.arrow: "->",
+        TOK.colonColon: "::",
 
         // For debugging
         TOK.error: "error",
@@ -696,6 +776,8 @@ extern (C++) struct Token
         TOK.charLiteral: "charv",
         TOK.wcharLiteral: "wcharv",
         TOK.dcharLiteral: "dcharv",
+        TOK.wchar_tLiteral: "wchar_tv",
+        TOK.compoundLiteral: "compoundliteral",
 
         TOK.halt: "halt",
         TOK.hexadecimalString: "xstring",
@@ -707,6 +789,31 @@ extern (C++) struct Token
 
         TOK.objcClassReference: "class",
         TOK.vectorArray: "vectorarray",
+
+        // C only keywords
+        TOK.inline    : "inline",
+        TOK.register  : "register",
+        TOK.restrict  : "restrict",
+        TOK.signed    : "signed",
+        TOK.sizeof_   : "sizeof",
+        TOK.typedef_  : "typedef",
+        TOK.unsigned  : "unsigned",
+        TOK.volatile  : "volatile",
+        TOK._Alignas  : "_Alignas",
+        TOK._Alignof  : "_Alignof",
+        TOK._Atomic   : "_Atomic",
+        TOK._Bool     : "_Bool",
+        TOK._Complex  : "_Complex",
+        TOK._Generic  : "_Generic",
+        TOK._Imaginary: "_Imaginary",
+        TOK._Noreturn : "_Noreturn",
+        TOK._Static_assert : "_Static_assert",
+        TOK._Thread_local  : "_Thread_local",
+
+        // C only extended keywords
+        TOK.__cdecl        : "__cdecl",
+        TOK.__declspec     : "__declspec",
+        TOK.__attribute__  : "__attribute__",
     ];
 
     static assert(() {
@@ -776,6 +883,7 @@ nothrow:
         case TOK.charLiteral:
         case TOK.wcharLiteral:
         case TOK.dcharLiteral:
+        case TOK.wchar_tLiteral:
             sprintf(&buffer[0], "%uU", cast(d_uns32)unsvalue);
             break;
         case TOK.int64Literal:
@@ -901,13 +1009,14 @@ nothrow:
         return p;
     }
 
-    static const(char)* toChars(ubyte value)
+    static const(char)* toChars(uint value)
     {
         return toString(value).ptr;
     }
 
-    extern (D) static string toString(ubyte value) pure nothrow @nogc @safe
+    extern (D) static string toString(uint value) pure nothrow @nogc @safe
     {
         return tochars[value];
     }
 }
+

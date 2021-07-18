@@ -14,6 +14,8 @@
 
 module dmd.dmangle;
 
+import dmd.astenums;
+
 /******************************************************************************
  * Returns exact mangled name of function.
  */
@@ -35,7 +37,7 @@ extern (C++) void mangleToBuffer(Type t, OutBuffer* buf)
         buf.writestring(t.deco);
     else
     {
-        scope Mangler v = new Mangler(buf);
+        scope Mangler v = new Mangler(buf, t);
         v.visitWithMask(t, 0);
     }
 }
@@ -57,29 +59,6 @@ extern (C++) void mangleToBuffer(TemplateInstance ti, OutBuffer* buf)
     scope Mangler v = new Mangler(buf);
     v.mangleTemplateInstance(ti);
 }
-
-/******************************************************************************
- * Mangle function signatures ('this' qualifier, and parameter types)
- * to check conflicts in function overloads.
- * It's different from fd.type.deco. For example, fd.type.deco would be null
- * if fd is an auto function.
- *
- * Params:
- *    buf = `OutBuffer` to write the mangled function signature to
-*     fd  = `FuncDeclaration` to mangle
- */
-void mangleToFuncSignature(ref OutBuffer buf, FuncDeclaration fd)
-{
-    auto tf = fd.type.isTypeFunction();
-
-    scope Mangler v = new Mangler(&buf);
-
-    MODtoDecoBuffer(&buf, tf.mod);
-    foreach (idx, param; tf.parameterList)
-        param.accept(v);
-    buf.writeByte('Z' - tf.parameterList.varargs);
-}
-
 
 /// Returns: `true` if the given character is a valid mangled character
 package bool isValidMangling(dchar c) nothrow
@@ -111,6 +90,31 @@ unittest
     assert(!'\\'.isValidMangling);
 }
 
+/**********************************************
+ * Convert a string representing a type (the deco) and
+ * return its equivalent Type.
+ * Params:
+ *      deco = string containing the deco
+ * Returns:
+ *      null for failed to convert
+ *      Type for succeeded
+ */
+
+public Type decoToType(const(char)[] deco)
+{
+    //printf("decoToType(): %.*s\n", cast(int)deco.length, deco.ptr);
+    if (auto sv = Type.stringtable.lookup(deco))
+    {
+        if (sv.value)
+        {
+            Type t = cast(Type)sv.value;
+            assert(t.deco);
+            return t;
+        }
+    }
+    return null;
+}
+
 
 /***************************************** private ***************************************/
 
@@ -138,6 +142,7 @@ import dmd.root.ctfloat;
 import dmd.root.outbuffer;
 import dmd.root.aav;
 import dmd.root.string;
+import dmd.root.stringtable;
 import dmd.target;
 import dmd.tokens;
 import dmd.utf;
@@ -186,7 +191,7 @@ private immutable char[TMAX] mangleChar =
     //              K   // ref
     //              L   // lazy
     //              M   // has this, or scope
-    //              N   // Nh:vector Ng:wild
+    //              N   // Nh:vector Ng:wild Nn:noreturn
     //              O   // shared
     Tpointer     : 'P',
     //              Q   // Type/symbol/identifier backward reference
@@ -210,6 +215,8 @@ private immutable char[TMAX] mangleChar =
     Tvector      : '@',
     Ttraits      : '@',
     Tmixin       : '@',
+    Ttag         : '@',
+    Tnoreturn    : '@',         // becomes 'Nn'
 ];
 
 unittest
@@ -282,10 +289,12 @@ public:
     AssocArray!(Type, size_t) types;        // Type => (offset+1) in buf
     AssocArray!(Identifier, size_t) idents; // Identifier => (offset+1) in buf
     OutBuffer* buf;
+    Type rootType;
 
-    extern (D) this(OutBuffer* buf)
+    extern (D) this(OutBuffer* buf, Type rootType = null)
     {
         this.buf = buf;
+        this.rootType = rootType;
     }
 
     /**
@@ -293,7 +302,7 @@ public:
     *  using upper case letters for all digits but the last digit which uses
     *  a lower case letter.
     * The decoder has to look up the referenced position to determine
-    *  whether the back reference is an identifer (starts with a digit)
+    *  whether the back reference is an identifier (starts with a digit)
     *  or a type (starts with a letter).
     *
     * Params:
@@ -331,9 +340,28 @@ public:
     */
     bool backrefType(Type t)
     {
-        if (!t.isTypeBasic())
-            return backrefImpl(types, t);
-        return false;
+        if (t.isTypeBasic())
+            return false;
+
+        /**
+         * https://issues.dlang.org/show_bug.cgi?id=21591
+         *
+         * Special case for unmerged TypeFunctions: use the generic merged
+         * function type as backref cache key to avoid missed backrefs.
+         *
+         * Merging is based on mangling, so we need to avoid an infinite
+         * recursion by excluding the case where `t` is the root type passed to
+         * `mangleToBuffer()`.
+         */
+        if (t != rootType)
+        {
+            if (t.isFunction_Delegate_PtrToFunction())
+            {
+                t = t.merge2();
+            }
+        }
+
+        return backrefImpl(types, t);
     }
 
     /**
@@ -565,6 +593,11 @@ public:
         visit(cast(Type)t);
     }
 
+    override void visit(TypeNoreturn t)
+    {
+        buf.writestring("Nn");
+    }
+
     ////////////////////////////////////////////////////////////////////////////
     void mangleDecl(Declaration sthis)
     {
@@ -626,7 +659,7 @@ public:
                     n /= 10;
                     ++ndigits;
                 }
-                buf.printf("%u__S%u", ndigits + 4, localNum);
+                buf.printf("%u__S%u", ndigits + 3, localNum);
             }
         }
     }
@@ -1213,6 +1246,15 @@ public:
         }
     }
 
+    override void visit(FuncExp e)
+    {
+        buf.writeByte('f');
+        if (e.td)
+            mangleSymbol(e.td);
+        else
+            mangleSymbol(e.fd);
+    }
+
     ////////////////////////////////////////////////////////////////////////////
 
     override void visit(Parameter p)
@@ -1253,4 +1295,3 @@ public:
         visitWithMask(p.type, (p.storageClass & STC.in_) ? MODFlags.const_ : 0);
     }
 }
-

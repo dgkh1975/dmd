@@ -26,9 +26,11 @@ private nothrow void err_nomem();
 
 struct Outbuffer
 {
-    ubyte *buf;         // the buffer itself
-    ubyte *pend;        // pointer past the end of the buffer
-    private ubyte *p;   // current position in buffer
+  @safe:
+
+    ubyte *buf;           // the buffer itself
+    private ubyte *pend;  // pointer past the end of the buffer
+    private ubyte *p;     // current position in buffer
 
   nothrow:
     this(size_t initialSize)
@@ -38,10 +40,11 @@ struct Outbuffer
 
     //~this() { dtor(); }
 
+    @trusted
     void dtor()
     {
-        if (auto slice = this.extractSlice())
-            free(slice.ptr);
+        free(buf);
+        buf = p = pend = null;
     }
 
     void reset()
@@ -49,8 +52,7 @@ struct Outbuffer
         p = buf;
     }
 
-    // Returns: A slice to the data written so far
-    extern(D) inout(ubyte)[] opSlice(size_t from, size_t to) inout
+    private extern(D) inout(ubyte)[] opSlice(size_t from, size_t to) inout
         @trusted pure nothrow @nogc
     {
         assert(this.buf, "Attempt to dereference a null pointer");
@@ -59,10 +61,10 @@ struct Outbuffer
         return this.buf[from .. to];
     }
 
-    /// Ditto
+    // Returns: A slice to the data written so far
     extern(D) inout(ubyte)[] opSlice() inout @trusted pure nothrow @nogc
     {
-        return this.buf[0 .. this.p - this.buf];
+        return this.buf[0 .. length];
     }
 
     extern(D) ubyte[] extractSlice() @safe pure nothrow @nogc
@@ -80,38 +82,48 @@ struct Outbuffer
      */
     void reserve(size_t nbytes)
     {
+        // non-inline function for the heavy/infrequent reallocation case
+        @trusted static void enlarge(ref Outbuffer b, size_t nbytes)
+        {
+            pragma(inline, false);  // do not inline slow path
+
+            if (b.buf is null)
+            {
+                // Special-case the overwhelmingly most frequent situation
+                if (nbytes < 64)
+                    nbytes = 64;
+                b.p = b.buf = cast(ubyte*) malloc(nbytes);
+                b.pend = b.buf + nbytes;
+            }
+            else
+            {
+                const size_t used = b.p - b.buf;
+                const size_t oldlen = b.pend - b.buf;
+                // Ensure exponential growth, oldlen * 2 for small sizes, oldlen * 1.5 for big sizes
+                const size_t minlen = oldlen + (oldlen >> (oldlen > 1024 * 64));
+
+                size_t len = used + nbytes;
+                if (len < minlen)
+                    len = minlen;
+                // Round up to cache line size
+                len = (len + 63) & ~63;
+
+                b.buf = cast(ubyte*) realloc(b.buf, len);
+
+                b.pend = b.buf + len;
+                b.p = b.buf + used;
+            }
+            if (!b.buf)
+                err_nomem();
+        }
+
         // Keep small so it is inlined
         if (pend - p < nbytes)
-            enlarge(nbytes);
+            enlarge(this, nbytes);
     }
-
-    // Reserve nbytes in buffer
-    void enlarge(size_t nbytes)
-    {
-        pragma(inline, false);  // do not inline slow path
-        const size_t oldlen = pend - buf;
-        const size_t used = p - buf;
-
-        size_t len = used + nbytes;
-        // No need to reallocate
-        if (nbytes < (pend - p))
-            return;
-
-        const size_t newlen = oldlen + (oldlen >> 1);   // oldlen * 1.5
-        if (len < newlen)
-            len = newlen;
-        len = (len + 15) & ~15;
-
-        buf = cast(ubyte*) realloc(buf,len);
-        if (!buf)
-            err_nomem();
-
-        pend = buf + len;
-        p = buf + used;
-    }
-
 
     // Write n zeros; return pointer to start of zeros
+    @trusted
     void *writezeros(size_t n)
     {
         reserve(n);
@@ -121,6 +133,7 @@ struct Outbuffer
     }
 
     // Position buffer to accept the specified number of bytes at offset
+    @trusted
     void position(size_t offset, size_t nbytes)
     {
         if (offset + nbytes > pend - buf)
@@ -135,6 +148,7 @@ struct Outbuffer
     }
 
     // Write an array to the buffer, no reserve check
+    @trusted
     void writen(const void *b, size_t len)
     {
         memcpy(p,b,len);
@@ -142,6 +156,7 @@ struct Outbuffer
     }
 
     // Write an array to the buffer.
+    @trusted
     extern (D)
     void write(const(void)[] b)
     {
@@ -150,6 +165,7 @@ struct Outbuffer
         p += b.length;
     }
 
+    @trusted
     void write(const(void)* b, size_t len)
     {
         write(b[0 .. len]);
@@ -158,23 +174,26 @@ struct Outbuffer
     /**
      * Writes an 8 bit byte, no reserve check.
      */
-    void writeByten(ubyte v)
+    @trusted
+    void writeByten(int v)
     {
-        *p++ = v;
+        *p++ = cast(ubyte)v;
     }
 
     /**
      * Writes an 8 bit byte.
      */
+    @trusted
     void writeByte(int v)
     {
         reserve(1);
-        *p++ = cast(ubyte)v;
+        writeByten(v);
     }
 
     /**
      * Writes a 16 bit value, no reserve check.
      */
+    @trusted
     void write16n(int v)
     {
         *(cast(ushort *) p) = cast(ushort)v;
@@ -194,7 +213,7 @@ struct Outbuffer
     /**
      * Writes a 32 bit int.
      */
-    void write32(int v)
+    @trusted void write32(int v)
     {
         reserve(4);
         *cast(int *)p = v;
@@ -204,37 +223,17 @@ struct Outbuffer
     /**
      * Writes a 64 bit long.
      */
-    void write64(long v)
+    @trusted void write64(long v)
     {
         reserve(8);
         *cast(long *)p = v;
         p += 8;
     }
 
-
-    /**
-     * Writes a 32 bit float.
-     */
-    void writeFloat(float v)
-    {
-        reserve(float.sizeof);
-        *cast(float *)p = v;
-        p += float.sizeof;
-    }
-
-    /**
-     * Writes a 64 bit double.
-     */
-    void writeDouble(double v)
-    {
-        reserve(double.sizeof);
-        *cast(double *)p = v;
-        p += double.sizeof;
-    }
-
     /**
      * Writes a String as a sequence of bytes.
      */
+    @trusted
     void write(const(char)* s)
     {
         write(s[0 .. strlen(s)]);
@@ -243,6 +242,7 @@ struct Outbuffer
     /**
      * Writes a 0 terminated String
      */
+    @trusted
     void writeString(const(char)* s)
     {
         write(s[0 .. strlen(s)+1]);
@@ -264,6 +264,7 @@ struct Outbuffer
     /**
      * Inserts string at beginning of buffer.
      */
+    @trusted
     void prependBytes(const(char)* s)
     {
         prepend(s, strlen(s));
@@ -272,6 +273,7 @@ struct Outbuffer
     /**
      * Inserts bytes at beginning of buffer.
      */
+    @trusted
     void prepend(const(void)* b, size_t len)
     {
         reserve(len);
@@ -283,6 +285,7 @@ struct Outbuffer
     /**
      * Bracket buffer contents with c1 and c2.
      */
+    @trusted
     void bracket(char c1,char c2)
     {
         reserve(2);
@@ -303,7 +306,7 @@ struct Outbuffer
     /**
      * Set current size of buffer.
      */
-
+    @trusted
     void setsize(size_t size)
     {
         p = buf + size;

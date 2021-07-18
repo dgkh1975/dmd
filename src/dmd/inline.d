@@ -20,6 +20,7 @@ import core.stdc.string;
 import dmd.aggregate;
 import dmd.apply;
 import dmd.arraytypes;
+import dmd.astenums;
 import dmd.attrib;
 import dmd.declaration;
 import dmd.dmodule;
@@ -910,10 +911,7 @@ public:
 
         override void visit(ArrayExp e)
         {
-            auto ce = e.copy().isArrayExp();
-            ce.e1 = doInlineAs!Expression(e.e1, ids);
-            ce.arguments = arrayExpressionDoInline(e.arguments);
-            result = ce;
+            assert(0); // this should have been lowered to something else
         }
 
         override void visit(CondExp e)
@@ -2061,7 +2059,7 @@ private void expandInline(Loc callLoc, FuncDeclaration fd, FuncDeclaration paren
              * any calls to the fp or dg can be inlined.
              */
             if (vfrom.type.ty == Tdelegate ||
-                vfrom.type.ty == Tpointer && vfrom.type.nextOf().ty == Tfunction)
+                vfrom.type.isPtrToFunction())
             {
                 if (auto ve = arg.isVarExp())
                 {

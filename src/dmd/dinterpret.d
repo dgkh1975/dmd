@@ -18,6 +18,7 @@ import core.stdc.stdlib;
 import core.stdc.string;
 import dmd.apply;
 import dmd.arraytypes;
+import dmd.astenums;
 import dmd.attrib;
 import dmd.builtin;
 import dmd.constfold;
@@ -71,6 +72,10 @@ public Expression ctfeInterpret(Expression e)
         case TOK.super_:
         case TOK.type:
         case TOK.typeid_:
+        case TOK.template_:              // non-eponymous template/instance
+        case TOK.scope_:                 // ditto
+        case TOK.dotTemplateDeclaration: // ditto, e.e1 doesn't matter here
+        case TOK.dot:                    // ditto
              if (e.type.ty == Terror)
                 return ErrorExp.get();
             goto case TOK.error;
@@ -346,7 +351,7 @@ public:
     extern (C++) void pop(VarDeclaration v)
     {
         assert(!v.isDataseg() || v.isCTFE());
-        assert(!(v.storage_class & (STC.ref_ | STC.out_)));
+        assert(!v.isReference());
         const oldid = v.ctfeAdrOnStack;
         v.ctfeAdrOnStack = cast(uint)cast(size_t)savedId[oldid];
         if (v.ctfeAdrOnStack == values.dim - 1)
@@ -2090,6 +2095,7 @@ public:
                     e = v._init.initializerToExpression();
                 }
                 else
+                    // Zero-length arrays don't have an initializer
                     e = v.type.defaultInitLiteral(e.loc);
 
                 e = interpret(e, istate);
@@ -2102,17 +2108,23 @@ public:
             else
             {
                 e = hasValue(v) ? getValue(v) : null;
-                if (!e && !v.isCTFE() && v.isDataseg())
-                {
-                    error(loc, "static variable `%s` cannot be read at compile time", v.toChars());
-                    return CTFEExp.cantexp;
-                }
                 if (!e)
                 {
-                    assert(!(v._init && v._init.isVoidInitializer()));
-                    // CTFE initiated from inside a function
-                    error(loc, "variable `%s` cannot be read at compile time", v.toChars());
-                    return CTFEExp.cantexp;
+                    // Zero-length arrays don't have an initializer
+                    if (v.type.size() == 0)
+                        e = v.type.defaultInitLiteral(loc);
+                    else if (!v.isCTFE() && v.isDataseg())
+                    {
+                        error(loc, "static variable `%s` cannot be read at compile time", v.toChars());
+                        return CTFEExp.cantexp;
+                    }
+                    else
+                    {
+                        assert(!(v._init && v._init.isVoidInitializer()));
+                        // CTFE initiated from inside a function
+                        error(loc, "variable `%s` cannot be read at compile time", v.toChars());
+                        return CTFEExp.cantexp;
+                    }
                 }
                 if (auto vie = e.isVoidInitExp())
                 {
@@ -2120,7 +2132,7 @@ public:
                     errorSupplemental(vie.var.loc, "`%s` was uninitialized and used before set", vie.var.toChars());
                     return CTFEExp.cantexp;
                 }
-                if (goal != CTFEGoal.LValue && (v.isRef() || v.isOut()))
+                if (goal != CTFEGoal.LValue && v.isReference())
                     e = interpret(e, istate, goal);
             }
             if (!e)
@@ -2203,6 +2215,15 @@ public:
         result = getVarExp(e.loc, istate, e.var, goal);
         if (exceptionOrCant(result))
             return;
+
+        // Visit the default initializer for noreturn variables
+        // (Custom initializers would abort the current function call and exit above)
+        if (result.type.ty == Tnoreturn)
+        {
+            result.accept(this);
+            return;
+        }
+
         if ((e.var.storage_class & (STC.ref_ | STC.out_)) == 0 && e.type.baseElemOf().ty != Tstruct)
         {
             /* Ultimately, STC.ref_|STC.out_ check should be enough to see the
@@ -2225,6 +2246,12 @@ public:
             printf("%s DeclarationExp::interpret() %s\n", e.loc.toChars(), e.toChars());
         }
         Dsymbol s = e.declaration;
+        while (s.isAttribDeclaration())
+        {
+            auto ad = cast(AttribDeclaration)s;
+            assert(ad.decl && ad.decl.dim == 1); // Currently, only one allowed when parsing
+            s = (*ad.decl)[0];
+        }
         if (VarDeclaration v = s.isVarDeclaration())
         {
             if (TupleDeclaration td = v.toAlias().isTupleDeclaration())
@@ -2307,20 +2334,8 @@ public:
             }
             return;
         }
-        if (s.isAttribDeclaration() || s.isTemplateMixin() || s.isTupleDeclaration())
+        if (s.isTemplateMixin() || s.isTupleDeclaration())
         {
-            // Check for static struct declarations, which aren't executable
-            AttribDeclaration ad = e.declaration.isAttribDeclaration();
-            if (ad && ad.decl && ad.decl.dim == 1)
-            {
-                Dsymbol sparent = (*ad.decl)[0];
-                if (sparent.isAggregateDeclaration() || sparent.isTemplateDeclaration() || sparent.isAliasDeclaration())
-                {
-                    result = null;
-                    return; // static (template) struct declaration. Nothing to do.
-                }
-            }
-
             // These can be made to work, too lazy now
             e.error("declaration `%s` is not yet implemented in CTFE", e.toChars());
             result = CTFEExp.cantexp;
@@ -5722,12 +5737,26 @@ public:
             auto cre = cast(ClassReferenceExp)result;
             auto cd = cre.originalClass();
 
-            if (cd.dtor)
+            // Find dtor(s) in inheritance chain
+            do
             {
-                result = interpretFunction(pue, cd.dtor, istate, null, cre);
-                if (exceptionOrCant(result))
-                    return;
-            }
+                if (cd.dtor)
+                {
+                    result = interpretFunction(pue, cd.dtor, istate, null, cre);
+                    if (exceptionOrCant(result))
+                        return;
+
+                    // Dtors of Non-extern(D) classes use implicit chaining (like structs)
+                    import dmd.aggregate : ClassKind;
+                    if (cd.classKind != ClassKind.d)
+                        break;
+                }
+
+                // Emulate manual chaining as done in rt_finalize2
+                cd = cd.baseClass;
+
+            } while (cd); // Stop after Object
+
             break;
 
         case Tpointer:

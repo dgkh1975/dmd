@@ -105,6 +105,7 @@ extern(C++) class StrictVisitor(AST) : ParseTimeVisitor!AST
     override void visit(AST.TypeBasic) { assert(0); }
     override void visit(AST.TypeError) { assert(0); }
     override void visit(AST.TypeNull) { assert(0); }
+    override void visit(AST.TypeNoreturn) { assert(0); }
     override void visit(AST.TypeVector) { assert(0); }
     override void visit(AST.TypeEnum) { assert(0); }
     override void visit(AST.TypeTuple) { assert(0); }
@@ -229,4 +230,5 @@ extern(C++) class StrictVisitor(AST) : ParseTimeVisitor!AST
     override void visit(AST.StructInitializer) { assert(0); }
     override void visit(AST.ArrayInitializer) { assert(0); }
     override void visit(AST.VoidInitializer) { assert(0); }
+    override void visit(AST.CInitializer) { assert(0); }
 }

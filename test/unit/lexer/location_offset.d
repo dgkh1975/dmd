@@ -256,8 +256,8 @@ immutable struct Test
 }
 
 enum Test[string] tests = [
-    "leftParentheses" : Test("left parentheses", "("),
-    "rightParentheses" : Test("right parentheses", ")"),
+    "leftParenthesis" : Test("left parenthesis", "("),
+    "rightParenthesis" : Test("right parenthesis", ")"),
     "leftBracket" : Test("left square bracket", "["),
     "rightBracket" : Test("right square bracket", "]"),
     "leftCurly" : Test("left curly brace", "{"),
@@ -450,6 +450,9 @@ enum Test[string] tests = [
     "goesTo" : Test("fat arrow", "=>"),
     "vector" : Test("__vector"),
     "pound" : Test("pound", "#"),
+
+    "arrow" : Test("arrow", "->"),
+    "colonColon" : Test("colonColon", "::"),
 ];
 
 // Ignore tokens not produced by the lexer or tested above
@@ -479,6 +482,7 @@ enum ignoreTokens
     arrayLiteral,
     assocArrayLiteral,
     structLiteral,
+    compoundLiteral,
     classReference,
     thrownException,
     delegatePointer,
@@ -510,6 +514,31 @@ enum ignoreTokens
     showCtfeContext,
     objcClassReference,
     vectorArray,
+
+    wchar_tLiteral,
+    inline,
+    register,
+    restrict,
+    signed,
+    sizeof_,
+    typedef_,
+    unsigned,
+    volatile,
+    _Alignas,
+    _Alignof,
+    _Atomic,
+    _Bool,
+    _Complex,
+    _Generic,
+    _Imaginary,
+    _Noreturn,
+    _Static_assert,
+    _Thread_local,
+
+    __cdecl,
+    __declspec,
+    __attribute__,
+
     max_,
 };
 

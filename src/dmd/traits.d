@@ -18,12 +18,13 @@ import core.stdc.stdio;
 import dmd.aggregate;
 import dmd.arraytypes;
 import dmd.astcodegen;
+import dmd.astenums;
 import dmd.attrib;
 import dmd.canthrow;
 import dmd.dclass;
 import dmd.declaration;
-import dmd.denum;
 import dmd.dimport;
+import dmd.dmangle;
 import dmd.dmodule;
 import dmd.dscope;
 import dmd.dsymbol;
@@ -492,12 +493,8 @@ Expression semanticTraits(TraitsExp e, Scope* sc)
 
         if (t)
         {
-            if (t.ty == Tfunction)
-                return cast(TypeFunction)t;
-            else if (t.ty == Tdelegate)
-                return cast(TypeFunction)t.nextOf();
-            else if (t.ty == Tpointer && t.nextOf().ty == Tfunction)
-                return cast(TypeFunction)t.nextOf();
+            if (auto tf = t.isFunction_Delegate_PtrToFunction())
+                return tf;
         }
 
         return null;
@@ -524,8 +521,6 @@ Expression semanticTraits(TraitsExp e, Scope* sc)
                 auto y = s.isDeclaration();
             static if (is(T == FuncDeclaration))
                 auto y = s.isFuncDeclaration();
-            static if (is(T == EnumMember))
-                auto y = s.isEnumMember();
 
             if (!y || !fp(y))
                 return False();
@@ -537,7 +532,6 @@ Expression semanticTraits(TraitsExp e, Scope* sc)
     alias isDsymX = isX!Dsymbol;
     alias isDeclX = isX!Declaration;
     alias isFuncX = isX!FuncDeclaration;
-    alias isEnumMemX = isX!EnumMember;
 
     Expression isPkgX(bool function(Package) fp)
     {
@@ -950,6 +944,32 @@ Expression semanticTraits(TraitsExp e, Scope* sc)
         ex = ex.expressionSemantic(sc);
         return ex;
     }
+    if (e.ident == Id.toType)
+    {
+        if (dim != 1)
+            return dimError(1);
+
+        auto ex = isExpression((*e.args)[0]);
+        if (!ex)
+        {
+            e.error("expression expected as second argument of __traits `%s`", e.ident.toChars());
+            return ErrorExp.get();
+        }
+        ex = ex.ctfeInterpret();
+
+        StringExp se = semanticString(sc, ex, "__traits(toType, string)");
+        if (!se)
+        {
+            return ErrorExp.get();
+        }
+        Type t = decoToType(se.toUTF8(sc).peekString());
+        if (!t)
+        {
+            e.error("cannot determine `%s`", e.toChars());
+            return ErrorExp.get();
+        }
+        return (new TypeExp(e.loc, t)).expressionSemantic(sc);
+    }
     if (e.ident == Id.hasMember ||
         e.ident == Id.getMember ||
         e.ident == Id.getOverloads ||
@@ -1142,7 +1162,10 @@ Expression semanticTraits(TraitsExp e, Scope* sc)
                                 td.overroot = null;
                                 td.overnext = null;
                             }
-                            exps.push(new DsymbolExp(Loc.initial, td, false));
+
+                            auto e = ex ? new DotTemplateExp(Loc.initial, ex, td)
+                                        : new DsymbolExp(Loc.initial, td);
+                            exps.push(e);
                         }
                     }
                     return 0;
@@ -1402,6 +1425,10 @@ Expression semanticTraits(TraitsExp e, Scope* sc)
             return ErrorExp.get();
         }
 
+        // Avoid further analysis for invalid functions leading to misleading error messages
+        if (!fparams.parameters)
+            return ErrorExp.get();
+
         StorageClass stc;
 
         // Set stc to storage class of the ith parameter
@@ -1442,10 +1469,10 @@ Expression semanticTraits(TraitsExp e, Scope* sc)
 
         if (stc & STC.out_)
             push("out");
-        else if (stc & STC.ref_)
-            push("ref");
         else if (stc & STC.in_)
             push("in");
+        else if (stc & STC.ref_)
+            push("ref");
         else if (stc & STC.lazy_)
             push("lazy");
         else if (stc & STC.alias_)
@@ -1573,6 +1600,9 @@ Expression semanticTraits(TraitsExp e, Scope* sc)
                 {
                     return 0;
                 }
+                // skip 'this' context pointers
+                else if (decl.isThisDeclaration())
+                    return 0;
             }
 
             // https://issues.dlang.org/show_bug.cgi?id=20915

@@ -22,6 +22,7 @@ import core.stdc.stdio;
 import core.stdc.string;
 import dmd.aggregate;
 import dmd.arraytypes;
+import dmd.astenums;
 import dmd.blockexit;
 import dmd.gluelayer;
 import dmd.dclass;
@@ -1063,9 +1064,16 @@ extern (C++) class FuncDeclaration : Declaration
     }
 
     /********************************
-     * Labels are in a separate scope, one per function.
+     * Searches for a label with the given identifier. This function will insert a new
+     * `LabelDsymbol` into `labtab` if it does not contain a mapping for `ident`.
+     *
+     * Params:
+     *   ident = identifier of the requested label
+     *   loc   = location used when creating a new `LabelDsymbol`
+     *
+     * Returns: the `LabelDsymbol` for `ident`
      */
-    final LabelDsymbol searchLabel(Identifier ident)
+    final LabelDsymbol searchLabel(Identifier ident, const ref Loc loc = Loc.initial)
     {
         Dsymbol s;
         if (!labtab)
@@ -1074,7 +1082,7 @@ extern (C++) class FuncDeclaration : Declaration
         s = labtab.lookup(ident);
         if (!s)
         {
-            s = new LabelDsymbol(ident);
+            s = new LabelDsymbol(ident, loc);
             labtab.insert(s);
         }
         return cast(LabelDsymbol)s;
@@ -1328,7 +1336,7 @@ extern (C++) class FuncDeclaration : Declaration
             flags |= FUNCFLAG.returnInprocess;
 
         // Initialize for inferring STC.scope_
-        if (global.params.vsafe)
+        if (global.params.useDIP1000 == FeatureState.enabled)
             flags |= FUNCFLAG.inferScope;
     }
 
@@ -2502,7 +2510,8 @@ extern (C++) class FuncDeclaration : Declaration
         if (type)
         {
             TypeFunction fdtype = type.isTypeFunction();
-            return fdtype.parameterList;
+            if (fdtype) // Could also be TypeError
+                return fdtype.parameterList;
         }
 
         return ParameterList(null, VarArg.none);
@@ -2880,7 +2889,8 @@ enum FuncResolveFlag : ubyte
 {
     standard = 0,       /// issue error messages, solve the call.
     quiet = 1,          /// do not issue error message on no match, just return `null`.
-    overloadOnly = 2,   /// only resolve overloads.
+    overloadOnly = 2,   /// only resolve overloads, i.e. do not issue error on ambiguous
+                        /// matches and need explicit this.
 }
 
 /*******************************************
@@ -2946,7 +2956,7 @@ FuncDeclaration resolveFuncCall(const ref Loc loc, Scope* sc, Dsymbol s,
     /* Failed to find a best match.
      * Do nothing or print error.
      */
-    if (m.last <= MATCH.nomatch)
+    if (m.last == MATCH.nomatch)
     {
         // error was caused on matched function, not on the matching itself,
         // so return the function to produce a better diagnostic

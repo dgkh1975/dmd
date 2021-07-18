@@ -26,6 +26,7 @@ module dmd.attrib;
 
 import dmd.aggregate;
 import dmd.arraytypes;
+import dmd.astenums;
 import dmd.cond;
 import dmd.declaration;
 import dmd.dmodule;
@@ -88,8 +89,8 @@ extern (C++) abstract class AttribDeclaration : Dsymbol
         if (stc != sc.stc ||
             linkage != sc.linkage ||
             cppmangle != sc.cppmangle ||
-            !visibility.isSubsetOf(sc.visibility) ||
             explicitVisibility != sc.explicitVisibility ||
+            visibility != sc.visibility ||
             aligndecl !is sc.aligndecl ||
             inlining != sc.inlining)
         {

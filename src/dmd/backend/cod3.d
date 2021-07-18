@@ -57,6 +57,7 @@ version (SCPP)
 extern (C++):
 
 nothrow:
+@safe:
 
 version (MARS)
     enum MARS = true;
@@ -223,6 +224,7 @@ private __gshared ubyte[256] inssize2 =
  *      idx = set to location in regsave for use in REGSAVE_restore()
  */
 
+@trusted
 void REGSAVE_save(ref REGSAVE regsave, ref CodeBuilder cdb, reg_t reg, out uint idx)
 {
     if (isXMMreg(reg))
@@ -259,6 +261,7 @@ void REGSAVE_save(ref REGSAVE regsave, ref CodeBuilder cdb, reg_t reg, out uint 
  * Complement REGSAVE_save().
  */
 
+@trusted
 void REGSAVE_restore(const ref REGSAVE regsave, ref CodeBuilder cdb, reg_t reg, uint idx)
 {
     if (isXMMreg(reg))
@@ -283,6 +286,7 @@ void REGSAVE_restore(const ref REGSAVE regsave, ref CodeBuilder cdb, reg_t reg, 
  * Size for vex encoded instruction.
  */
 
+@trusted
 ubyte vex_inssize(code *c)
 {
     assert(c.Iflags & CFvex && c.Ivex.pfx == 0xC4);
@@ -317,6 +321,7 @@ ubyte vex_inssize(code *c)
  * Determine if there is a modregrm byte for code.
  */
 
+@trusted
 int cod3_EA(code *c)
 {   uint ins;
 
@@ -337,6 +342,7 @@ int cod3_EA(code *c)
  * called by: codgen
  */
 
+@trusted
 void cod3_initregs()
 {
     if (I64)
@@ -355,6 +361,7 @@ void cod3_initregs()
  * set initial global variable values
  */
 
+@trusted
 void cod3_setdefault()
 {
     fregsaved = mBP | mSI | mDI;
@@ -363,7 +370,7 @@ void cod3_setdefault()
 /********************************
  * Fix global variables for 386.
  */
-
+@trusted
 void cod3_set32()
 {
     inssize[0xA0] = T|5;
@@ -388,6 +395,7 @@ void cod3_set32()
  * Fix global variables for I64.
  */
 
+@trusted
 void cod3_set64()
 {
     inssize[0xA0] = T|5;                // MOV AL,mem
@@ -419,6 +427,7 @@ void cod3_set64()
  *      seg = segment to write alignment bytes to
  *      nbytes = number of alignment bytes to write
  */
+@trusted
 void cod3_align_bytes(int seg, size_t nbytes)
 {
     /* Table 4-2 from Intel Instruction Set Reference M-Z
@@ -473,6 +482,7 @@ void cod3_align_bytes(int seg, size_t nbytes)
  * Params:
  *      seg = segment of function
  */
+@trusted
 void cod3_align(int seg)
 {
     if (config.exe & EX_windos)
@@ -607,11 +617,13 @@ void cod3_buildmodulector(Outbuffer* buf, int codeOffset, int refOffset)
  *      tyf     function type
  */
 
+@trusted
 regm_t regmask(tym_t tym, tym_t tyf)
 {
     switch (tybasic(tym))
     {
         case TYvoid:
+        case TYnoreturn:
         case TYstruct:
         case TYarray:
             return 0;
@@ -737,8 +749,10 @@ void cgreg_dst_regs(reg_t* dst_integer_reg, reg_t* dst_float_reg)
     *dst_float_reg   = XMM0;
 }
 
+@trusted
 void cgreg_set_priorities(tym_t ty, const(reg_t)** pseq, const(reg_t)** pseqmsw)
 {
+    //printf("cgreg_set_priorities %x\n", ty);
     const sz = tysize(ty);
 
     if (tyxmmreg(ty))
@@ -801,6 +815,7 @@ void cgreg_set_priorities(tym_t ty, const(reg_t)** pseq, const(reg_t)** pseqmsw)
  * Returns:
  *      code generated
  */
+@trusted
 private code *callFinallyBlock(block *bf, regm_t retregs)
 {
     CodeBuilder cdbs; cdbs.ctor();
@@ -828,6 +843,7 @@ private code *callFinallyBlock(block *bf, regm_t retregs)
 /*******************************
  * Generate block exit code
  */
+@trusted
 void outblkexitcode(ref CodeBuilder cdb, block *bl, ref int anyspill, const(char)* sflsave, Symbol** retsym, const regm_t mfuncregsave)
 {
     CodeBuilder cdb2; cdb2.ctor();
@@ -1219,7 +1235,6 @@ static if (NTEXCEPTIONS)
             goto L4;
 
         case BCret:
-        case BCexit:
             retregs = 0;
             gencodelem(cdb,e,&retregs,true);
         L4:
@@ -1233,12 +1248,7 @@ static if (NTEXCEPTIONS)
                 pop87();                // account for return value
             }
 
-            if (bl.BC == BCexit)
-            {
-                if (config.flags4 & CFG4optimized)
-                    mfuncreg = mfuncregsave;
-            }
-            else if (MARS || usednteh & NTEH_try)
+            if (MARS || usednteh & NTEH_try)
             {
                 block *bt = bl;
                 while ((bt = bt.Btry) != null)
@@ -1281,6 +1291,13 @@ version (MARS)
                     }
                 }
             }
+            break;
+
+        case BCexit:
+            retregs = 0;
+            gencodelem(cdb,e,&retregs,true);
+            if (config.flags4 & CFG4optimized)
+                mfuncreg = mfuncregsave;
             break;
 
         case BCasm:
@@ -1339,7 +1356,8 @@ version (MARS)
  *    a bit mask of return registers.
  *    0 if function returns on the stack or returns void.
  */
-regm_t allocretregs(tym_t ty, type* t, tym_t tyf, out reg_t reg1, out reg_t reg2)
+@trusted
+regm_t allocretregs(const tym_t ty, type* t, const tym_t tyf, out reg_t reg1, out reg_t reg2)
 {
     //printf("allocretregs()\n");
     reg1 = reg2 = NOREG;
@@ -1350,10 +1368,11 @@ regm_t allocretregs(tym_t ty, type* t, tym_t tyf, out reg_t reg1, out reg_t reg2
     /* The rest is for the Itanium ABI
      */
 
-    if (tybasic(ty) == TYvoid)
+    const tyb = tybasic(ty);
+    if (tyb == TYvoid || tyb == TYnoreturn)
         return 0;
 
-    tym_t ty1 = ty;
+    tym_t ty1 = tyb;
     tym_t ty2 = TYMAX;  // stays TYMAX if only one register is needed
 
     if (ty & mTYxmmgpr)
@@ -1367,48 +1386,46 @@ regm_t allocretregs(tym_t ty, type* t, tym_t tyf, out reg_t reg1, out reg_t reg2
         ty2 = TYdouble;
     }
 
-    if (tybasic(ty) == TYstruct)
+    if (tyb == TYstruct)
     {
         assert(t);
         ty1 = t.Tty;
     }
 
+    const tyfb = tybasic(tyf);
     switch (tyrelax(ty1))
     {
         case TYcent:
-            if (!I64 || config.exe == EX_WIN64)
+            if (I32)
                 return 0;
             ty1 = ty2 = TYllong;
             break;
 
         case TYcdouble:
-            if (tybasic(tyf) == TYjfunc && I32)
+            if (tyfb == TYjfunc && I32)
                 break;
-            if (!I64 || config.exe == EX_WIN64)
+            if (I32)
                 return 0;
             ty1 = ty2 = TYdouble;
             break;
 
         case TYcfloat:
-            if (tybasic(tyf) == TYjfunc && I32)
+            if (tyfb == TYjfunc && I32)
                 break;
-            if (!I64)
+            if (I32)
                 goto case TYllong;
-            if (config.exe == EX_WIN64)
-                ty1 = TYllong;
-            else
-                ty1 = TYdouble;
+            ty1 = TYdouble;
             break;
 
         case TYcldouble:
-            if (tybasic(tyf) == TYjfunc && I32)
+            if (tyfb == TYjfunc && I32)
                 break;
-            if (!I64 || config.exe == EX_WIN64)
+            if (I32)
                 return 0;
             break;
 
         case TYllong:
-            if (!I64)
+            if (I32)
                 ty1 = ty2 = TYlong;
             break;
 
@@ -1425,42 +1442,15 @@ regm_t allocretregs(tym_t ty, type* t, tym_t tyf, out reg_t reg1, out reg_t reg2
 
         case TYstruct:
             assert(t);
-            if (I64 && config.exe != EX_WIN64)
+            if (I64)
             {
                 assert(tybasic(t.Tty) == TYstruct);
-                type *targ1 = t.Ttag.Sstruct.Sarg1type;
-                type *targ2 = t.Ttag.Sstruct.Sarg2type;
-                if (targ1)
+                if (const targ1 = t.Ttag.Sstruct.Sarg1type)
                     ty1 = targ1.Tty;
                 else
                     return 0;
-                if (targ2)
+                if (const targ2 = t.Ttag.Sstruct.Sarg2type)
                     ty2 = targ2.Tty;
-                break;
-            }
-            else if (!(t.Ttag.Sstruct.Sflags & STRnotpod))
-            {
-                // windows only, return POD of 1, 2, 4, or 8 bytes on EAX(:EDX)
-                if (!(config.exe & (EX_WIN64 | EX_WIN32)))
-                    return 0;
-
-                uint sz = cast(uint) type_size(t);
-
-                if (sz > 8 || sz == 0)
-                    return 0;
-
-                if (sz == 8)
-                {
-                    if (config.exe == EX_WIN64)
-                        ty1 = TYllong;
-                    else
-                        ty1 = ty2 = TYlong;
-                }
-                else if (sz == 4 || sz == 2 || sz == 1)
-                    ty1 = TYlong;
-                else
-                    return 0;
-
                 break;
             }
             return 0;
@@ -1505,7 +1495,7 @@ regm_t allocretregs(tym_t ty, type* t, tym_t tyf, out reg_t reg1, out reg_t reg2
         case 8:
             if (tycomplex(tym))
             {
-                assert(tybasic(tyf) == TYjfunc && I32);
+                assert(tyfb == TYjfunc && I32);
                 return ST01;
             }
             assert(I64 || tyfloating(tym));
@@ -1520,7 +1510,7 @@ regm_t allocretregs(tym_t ty, type* t, tym_t tyf, out reg_t reg1, out reg_t reg2
             {
                 return ST01;
             }
-            else if (tycomplex(tym) && tybasic(tyf) == TYjfunc && I32)
+            else if (tycomplex(tym) && tyfb == TYjfunc && I32)
             {
                 return ST01;
             }
@@ -1555,6 +1545,7 @@ struct CaseVal
     block *target;
 
     /* Sort function for qsort() */
+    @trusted
     extern (C) static nothrow int cmp(scope const(void*) p, scope const(void*) q)
     {
         const(CaseVal)* c1 = cast(const(CaseVal)*)p;
@@ -1567,6 +1558,7 @@ struct CaseVal
 /***
  * Generate comparison of [reg2,reg] with val
  */
+@trusted
 private void cmpval(ref CodeBuilder cdb, targ_llong val, uint sz, reg_t reg, reg_t reg2, reg_t sreg)
 {
     if (I64 && sz == 8)
@@ -1598,6 +1590,7 @@ private void cmpval(ref CodeBuilder cdb, targ_llong val, uint sz, reg_t reg, reg
     }
 }
 
+@trusted
 private void ifthen(ref CodeBuilder cdb, CaseVal *casevals, size_t ncases,
         uint sz, reg_t reg, reg_t reg2, reg_t sreg, block *bdefault, bool last)
 {
@@ -1654,6 +1647,7 @@ private void ifthen(ref CodeBuilder cdb, CaseVal *casevals, size_t ncases,
  *      BCswitch        search table for match
  */
 
+@trusted
 void doswitch(ref CodeBuilder cdb, block *b)
 {
     targ_ulong msw;
@@ -2099,6 +2093,7 @@ else
  * default label.
  */
 
+@trusted
 void outjmptab(block *b)
 {
     if (JMPJMPTABLE && I32)
@@ -2204,6 +2199,7 @@ void outjmptab(block *b)
  * second is the address table.
  */
 
+@trusted
 void outswitab(block *b)
 {
     //printf("outswitab()\n");
@@ -2256,8 +2252,10 @@ void outswitab(block *b)
  * Return a jump opcode relevant to the elem for a JMP true.
  */
 
+@trusted
 int jmpopcode(elem *e)
 {
+    //printf("jmpopcode()\n"); elem_print(e);
     tym_t tym;
     int zero,i,jp,op;
     static immutable ubyte[6][2][2] jops =
@@ -2302,6 +2300,19 @@ int jmpopcode(elem *e)
          (tyxmmreg(tymx) && config.fpxmmregs && e.Ecount != e.Ecomsub) ||
          op == OPind ||
          (OTcall(op) && (regmask(tymx, tybasic(e.EV.E1.Eoper)) & (mST0 | XMMREGS))));
+
+    if (!needsNanCheck)
+    {
+        /* If e is in an XMM register, need to use XP.
+         * Match same test in loaddata()
+         */
+        Symbol* s;
+        needsNanCheck = e.Eoper == OPvar &&
+            (s = e.EV.Vsym).Sfl == FLreg &&
+             s.Sregm & XMMREGS &&
+             (tymx == TYfloat || tymx == TYifloat || tymx == TYdouble || tymx ==TYidouble);
+    }
+
     if (e.Ecount != e.Ecomsub)          // comsubs just get Z bit set
     {
         if (needsNanCheck) // except for floating point values that need a NaN check
@@ -2422,6 +2433,7 @@ L1:
  *              into the lvalue
  */
 
+@trusted
 void cod3_ptrchk(ref CodeBuilder cdb,code *pcs,regm_t keepmsk)
 {
     ubyte sib;
@@ -2547,6 +2559,7 @@ void cod3_ptrchk(ref CodeBuilder cdb,code *pcs,regm_t keepmsk)
  *      mBP     can be used
  */
 
+@trusted
 regm_t cod3_useBP()
 {
     tym_t tym;
@@ -2598,6 +2611,7 @@ Lcant:
  * Generate code segment to be used later to restore a cse
  */
 
+@trusted
 bool cse_simple(code *c, elem *e)
 {
     regm_t regm;
@@ -2658,6 +2672,7 @@ bool cse_simple(code *c, elem *e)
  *      reg = register to save
  *      slot = index into common subexpression save area
  */
+@trusted
 void gen_storecse(ref CodeBuilder cdb, tym_t tym, reg_t reg, size_t slot)
 {
     // MOV slot[BP],reg
@@ -2679,6 +2694,7 @@ void gen_storecse(ref CodeBuilder cdb, tym_t tym, reg_t reg, size_t slot)
         code_orrex(cdb.last(), REX_W);
 }
 
+@trusted
 void gen_testcse(ref CodeBuilder cdb, tym_t tym, uint sz, size_t slot)
 {
     // CMP slot[BP],0
@@ -2690,6 +2706,7 @@ void gen_testcse(ref CodeBuilder cdb, tym_t tym, uint sz, size_t slot)
         code_orrex(cdb.last(), REX_W);
 }
 
+@trusted
 void gen_loadcse(ref CodeBuilder cdb, tym_t tym, reg_t reg, size_t slot)
 {
     // MOV reg,slot[BP]
@@ -2715,6 +2732,7 @@ void gen_loadcse(ref CodeBuilder cdb, tym_t tym, reg_t reg, size_t slot)
  * Gen code for OPframeptr
  */
 
+@trusted
 void cdframeptr(ref CodeBuilder cdb, elem *e, regm_t *pretregs)
 {
     regm_t retregs = *pretregs & allregs;
@@ -2737,6 +2755,7 @@ void cdframeptr(ref CodeBuilder cdb, elem *e, regm_t *pretregs)
  * This value gets cached in the local variable 'localgot'.
  */
 
+@trusted
 void cdgot(ref CodeBuilder cdb, elem *e, regm_t *pretregs)
 {
     if (config.exe & (EX_OSX | EX_OSX64))
@@ -2786,6 +2805,7 @@ void cdgot(ref CodeBuilder cdb, elem *e, regm_t *pretregs)
  * Load contents of localgot into EBX.
  */
 
+@trusted
 void load_localgot(ref CodeBuilder cdb)
 {
     if (config.exe & (EX_LINUX | EX_FREEBSD | EX_OPENBSD | EX_SOLARIS)) // note: I32 only
@@ -2818,6 +2838,7 @@ void load_localgot(ref CodeBuilder cdb)
  */
 
 
+@trusted
 int obj_namestring(char *p,const(char)* name)
 {
     size_t len = strlen(name);
@@ -2883,6 +2904,7 @@ void genmovreg(ref CodeBuilder cdb,uint to,uint from)
     genmovreg(cdb, to, from, TYMAX);
 }
 
+@trusted
 void genmovreg(ref CodeBuilder cdb, uint to, uint from, tym_t tym)
 {
     // register kind. ex: GPR,XMM,SEG
@@ -2954,6 +2976,7 @@ void genmovreg(ref CodeBuilder cdb, uint to, uint from, tym_t tym)
  * Optimize it into LEA's if we can.
  */
 
+@trusted
 void genmulimm(ref CodeBuilder cdb,uint r1,uint r2,targ_int imm)
 {
     // These optimizations should probably be put into pinholeopt()
@@ -3016,6 +3039,7 @@ void genshift(ref CodeBuilder cdb)
  *      code (if any) generated
  */
 
+@trusted
 void movregconst(ref CodeBuilder cdb,reg_t reg,targ_size_t value,regm_t flags)
 {
     reg_t r;
@@ -3292,6 +3316,7 @@ L3:
  * Generate a jump instruction.
  */
 
+@trusted
 void genjmp(ref CodeBuilder cdb,opcode_t op,uint fltarg,block *targ)
 {
     code cs;
@@ -3345,6 +3370,7 @@ void genjmp(ref CodeBuilder cdb,opcode_t op,uint fltarg,block *targ)
 /*********************************************
  * Generate first part of prolog for interrupt function.
  */
+@trusted
 void prolog_ifunc(ref CodeBuilder cdb, tym_t* tyf)
 {
     static immutable ubyte[4] ops2 = [ 0x60,0x1E,0x06,0 ];
@@ -3364,6 +3390,7 @@ void prolog_ifunc(ref CodeBuilder cdb, tym_t* tyf)
     *tyf |= mTYloadds;
 }
 
+@trusted
 void prolog_ifunc2(ref CodeBuilder cdb, tym_t tyf, tym_t tym, bool pushds)
 {
     /* Determine if we need to reload DS        */
@@ -3384,6 +3411,7 @@ void prolog_ifunc2(ref CodeBuilder cdb, tym_t tyf, tym_t tym, bool pushds)
         cdb.gen1(0xFC);                        // CLD
 }
 
+@trusted
 void prolog_16bit_windows_farfunc(ref CodeBuilder cdb, tym_t* tyf, bool* pushds)
 {
     int wflags = config.wflags;
@@ -3453,6 +3481,7 @@ void prolog_16bit_windows_farfunc(ref CodeBuilder cdb, tym_t* tyf, bool* pushds)
  * Returns:
  *      generated code
  */
+@trusted
 void prolog_frame(ref CodeBuilder cdb, bool farfunc, ref uint xlocalsize, out bool enter, out int cfa_offset)
 {
     //printf("prolog_frame\n");
@@ -3527,6 +3556,7 @@ static if (NTEXCEPTIONS == 2)
  * Returns:
  *      generated code
  */
+@trusted
 void prolog_stackalign(ref CodeBuilder cdb)
 {
     if (!enforcealign)
@@ -3537,6 +3567,7 @@ void prolog_stackalign(ref CodeBuilder cdb)
         cod3_stackalign(cdb, STACKALIGN);
 }
 
+@trusted
 void prolog_frameadj(ref CodeBuilder cdb, tym_t tyf, uint xlocalsize, bool enter, bool* pushalloc)
 {
     uint pushallocreg = (tyf == TYmfunc) ? CX : AX;
@@ -3627,6 +3658,7 @@ void prolog_frameadj2(ref CodeBuilder cdb, tym_t tyf, uint xlocalsize, bool* pus
         cod3_stackadj(cdb, xlocalsize);
 }
 
+@trusted
 void prolog_setupalloca(ref CodeBuilder cdb)
 {
     //printf("prolog_setupalloca() offset x%x size x%x alignment x%x\n",
@@ -3652,6 +3684,7 @@ void prolog_setupalloca(ref CodeBuilder cdb)
  *      cfa_offset = offset of frame pointer from CFA
  */
 
+@trusted
 void prolog_saveregs(ref CodeBuilder cdb, regm_t topush, int cfa_offset)
 {
     if (pushoffuse)
@@ -3749,6 +3782,7 @@ void prolog_saveregs(ref CodeBuilder cdb, regm_t topush, int cfa_offset)
  * Undo prolog_saveregs()
  */
 
+@trusted
 private void epilog_restoreregs(ref CodeBuilder cdb, regm_t topop)
 {
     debug
@@ -3834,6 +3868,7 @@ private void epilog_restoreregs(ref CodeBuilder cdb, regm_t topop)
 
 version (SCPP)
 {
+@trusted
 void prolog_trace(ref CodeBuilder cdb, bool farfunc, uint* regsaved)
 {
     Symbol *s = getRtlsym(farfunc ? RTLSYM_TRACE_PRO_F : RTLSYM_TRACE_PRO_N);
@@ -3886,6 +3921,7 @@ void prolog_trace(ref CodeBuilder cdb, bool farfunc, uint* regsaved)
  *      sv = symbol for __va_argsave
  *      namedargs = registers that named parameters (not ... arguments) were passed in.
  */
+@trusted
 void prolog_genvarargs(ref CodeBuilder cdb, Symbol* sv, regm_t namedargs)
 {
     /* Generate code to move any arguments passed in registers into
@@ -4041,6 +4077,7 @@ void prolog_gen_win64_varargs(ref CodeBuilder cdb)
  *      pushalloc = use PUSH to allocate on the stack rather than subtracting from SP
  *      namedargs = set to the registers that named parameters were passed in
  */
+@trusted
 void prolog_loadparams(ref CodeBuilder cdb, tym_t tyf, bool pushalloc, out regm_t namedargs)
 {
     //printf("prolog_loadparams()\n");
@@ -4120,10 +4157,16 @@ void prolog_loadparams(ref CodeBuilder cdb, tym_t tyf, bool pushalloc, out regm_
         reg_t preg = s.Spreg;
         foreach (i; 0 .. 2)     // twice, once for each possible parameter register
         {
+            static type* type_arrayBase(type* ta)
+            {
+                while (tybasic(ta.Tty) == TYarray)
+                    ta = ta.Tnext;
+                return ta;
+            }
             shadowregm |= mask(preg);
-            opcode_t op = 0x89;                  // MOV x[EBP],preg
-            if (isXMMreg(preg))
-                op = xmmstore((t.Tty & TYarray) && t.Tnext ? t.Tnext.Tty : t.Tty);
+            const opcode_t op = isXMMreg(preg)
+                ? xmmstore(type_arrayBase(t).Tty)
+                : 0x89;    // MOV x[EBP],preg
             if (!(pushalloc && preg == pushallocreg) || s.Sclass == SCshadowreg)
             {
                 if (hasframe && (!enforcealign || s.Sclass == SCshadowreg))
@@ -4343,6 +4386,7 @@ void prolog_loadparams(ref CodeBuilder cdb, tym_t tyf, bool pushalloc, out regm_
  *      retsize         Size of function epilog
  */
 
+@trusted
 void epilog(block *b)
 {
     code *cpopds;
@@ -4619,12 +4663,14 @@ static if (0)
  * Return offset of SP from BP.
  */
 
+@trusted
 targ_size_t cod3_spoff()
 {
     //printf("spoff = x%x, localsize = x%x\n", (int)spoff, (int)localsize);
     return spoff + localsize;
 }
 
+@trusted
 void gen_spill_reg(ref CodeBuilder cdb, Symbol* s, bool toreg)
 {
     code cs;
@@ -4685,6 +4731,7 @@ void gen_spill_reg(ref CodeBuilder cdb, Symbol* s, bool toreg)
  *      i =       offset into vtbl[]
  */
 
+@trusted
 void cod3_thunk(Symbol *sthunk,Symbol *sfunc,uint p,tym_t thisty,
         uint d,int i,uint d2)
 {
@@ -4864,6 +4911,7 @@ static if (0)
  * Assume symbol s is extern.
  */
 
+@trusted
 void makeitextern(Symbol *s)
 {
     if (s.Sxtrnnum == 0)
@@ -4887,6 +4935,7 @@ void makeitextern(Symbol *s)
  *      number of bytes saved
  */
 
+@trusted
 int branch(block *bl,int flag)
 {
     int bytesaved;
@@ -5094,6 +5143,7 @@ L3:
 
 version (MARS)
 {
+@trusted
 void cod3_adjSymOffsets()
 {
     SYMIDX si;
@@ -5156,6 +5206,7 @@ void cod3_adjSymOffsets()
  * in Vpointer.
  */
 
+@trusted
 void assignaddr(block *bl)
 {
     int EBPtoESPsave = EBPtoESP;
@@ -5171,6 +5222,7 @@ void assignaddr(block *bl)
     EBPtoESP = EBPtoESPsave;
 }
 
+@trusted
 void assignaddrc(code *c)
 {
     int sn;
@@ -5402,7 +5454,9 @@ void assignaddrc(code *c)
                 break;
 
             case FLpara:
-//printf("s = %s, Soffset = %d, Para.size = %d, BPoff = %d, EBPtoESP = %d\n", s.Sident.ptr, s.Soffset, Para.size, BPoff, EBPtoESP);
+                //printf("s = %s, Soffset = %d, Para.size = %d, BPoff = %d, EBPtoESP = %d, Vpointer = %d\n",
+                //s.Sident.ptr, cast(int)s.Soffset, cast(int)Para.size, cast(int)BPoff,
+                //cast(int)EBPtoESP, cast(int)c.IEV1.Vpointer);
                 soff = Para.size - BPoff;    // cancel out add of BPoff
                 goto L1;
 
@@ -5581,6 +5635,7 @@ void assignaddrc(code *c)
  * Return offset from BP of symbol s.
  */
 
+@trusted
 targ_size_t cod3_bpoffset(Symbol *s)
 {
     targ_size_t offset;
@@ -5626,6 +5681,7 @@ targ_size_t cod3_bpoffset(Symbol *s)
  *      c = code list to optimize
  */
 
+@trusted
 void pinholeopt(code *c,block *b)
 {
     targ_size_t a;
@@ -6208,6 +6264,7 @@ void pinholeopt(code *c,block *b)
 
 debug
 {
+@trusted
 private void pinholeopt_unittest()
 {
     //printf("pinholeopt_unittest()\n");
@@ -6296,6 +6353,7 @@ private void pinholeopt_unittest()
 }
 }
 
+@trusted
 void simplify_code(code* c)
 {
     reg_t reg;
@@ -6325,6 +6383,7 @@ void simplify_code(code* c)
  *       LOOP instructions only work for backward refs.
  */
 
+@trusted
 void jmpaddr(code *c)
 {
     code* ci,cn,ctarg,cstart;
@@ -6417,6 +6476,7 @@ uint calcblksize(code *c)
  * Note: This routine must be fast. Profiling shows it is significant.
  */
 
+@trusted
 uint calccodsize(code *c)
 {
     uint size;
@@ -6730,6 +6790,7 @@ nothrow:
     int seg;
     char[100] bytes; // = void;
 
+    @trusted
     this(int seg)
     {
         index = 0;
@@ -6737,6 +6798,7 @@ nothrow:
         this.seg = seg;
     }
 
+    @trusted
     void flushx()
     {
         // Emit accumulated bytes to code segment
@@ -6745,22 +6807,23 @@ nothrow:
         index = 0;
     }
 
+    @trusted
     void gen(char c) { bytes[index++] = c; }
 
+    @trusted
     void genp(size_t n, void *p) { memcpy(&bytes[index], p, n); index += n; }
 
+    @trusted
     void flush() { if (index) flushx(); }
 
+    @trusted
     uint getOffset() { return cast(uint)(offset + index); }
 
+    @trusted
     uint available() { return cast(uint)(bytes.sizeof - index); }
 }
 
-private void do8bit(MiniCodeBuf *pbuf, FL, evc *);
-private void do16bit(MiniCodeBuf *pbuf, FL, evc *,int);
-private void do32bit(MiniCodeBuf *pbuf, FL, evc *,int,int = 0);
-private void do64bit(MiniCodeBuf *pbuf, FL, evc *,int);
-
+@trusted
 uint codout(int seg, code *c)
 {
     ubyte rm,mod;
@@ -6861,7 +6924,7 @@ else
                 ggen.flush();
                 if (c.Iflags == CFaddrsize)    // kludge for DA inline asm
                 {
-                    do32bit(&ggen, FLblockoff,&c.IEV1,0);
+                    do32bit(&ggen, FLblockoff,&c.IEV1,0,0);
                 }
                 else
                 {
@@ -7127,7 +7190,7 @@ else
                             goto do16;
                         else
                     do32:
-                            do32bit(&ggen, cast(FL)c.IFL2,&c.IEV2,flags);
+                            do32bit(&ggen, cast(FL)c.IFL2,&c.IEV2,flags,0);
                         break;
 
                     case 0x9A:
@@ -7236,7 +7299,7 @@ else
             if ((rm & (7<<3)) == 0)     /* TEST mem16/32,immed16/32     */
             {
                 if ((I32 || I64) ^ ((c.Iflags & CFopsize) != 0))
-                    do32bit(&ggen, cast(FL)c.IFL2,&c.IEV2,flags);
+                    do32bit(&ggen, cast(FL)c.IFL2,&c.IEV2,flags,0);
                 else
                     do16bit(&ggen, cast(FL)c.IFL2,&c.IEV2,flags);
             }
@@ -7257,6 +7320,7 @@ else
 }
 
 
+@trusted
 private void do64bit(MiniCodeBuf *pbuf, FL fl, evc *uev,int flags)
 {
     char *p;
@@ -7363,6 +7427,7 @@ private void do64bit(MiniCodeBuf *pbuf, FL fl, evc *uev,int flags)
 }
 
 
+@trusted
 private void do32bit(MiniCodeBuf *pbuf, FL fl, evc *uev,int flags, int val)
 {
     char *p;
@@ -7530,6 +7595,7 @@ private void do32bit(MiniCodeBuf *pbuf, FL fl, evc *uev,int flags, int val)
 }
 
 
+@trusted
 private void do16bit(MiniCodeBuf *pbuf, FL fl, evc *uev,int flags)
 {
     char *p;
@@ -7612,6 +7678,7 @@ private void do16bit(MiniCodeBuf *pbuf, FL fl, evc *uev,int flags)
 }
 
 
+@trusted
 private void do8bit(MiniCodeBuf *pbuf, FL fl, evc *uev)
 {
     char c;
@@ -7654,6 +7721,7 @@ version (SCPP)
 {
 static if (HYDRATE)
 {
+@trusted
 void code_hydrate(code **pc)
 {
     code *c;
@@ -7828,6 +7896,7 @@ version (SCPP)
 
 static if (DEHYDRATE)
 {
+@trusted
 void code_dehydrate(code **pc)
 {
     code *c;
@@ -8007,6 +8076,7 @@ void WRcodlst(code *c)
         code_print(c);
 }
 
+@trusted
 extern (C) void code_print(code* c)
 {
     ubyte ins;

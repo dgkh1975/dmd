@@ -12,6 +12,7 @@
 module dmd.compiler;
 
 import dmd.astcodegen;
+import dmd.astenums;
 import dmd.arraytypes;
 import dmd.dmodule;
 import dmd.dscope;
@@ -37,9 +38,6 @@ version (DMDLIB)
 
 extern (C++) __gshared
 {
-    /// Module in which the D main is
-    Module rootHasMain = null;
-
     bool includeImports = false;
     // array of module patterns used to include/exclude imported modules
     Array!(const(char)*) includeModulePatterns;

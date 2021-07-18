@@ -81,8 +81,10 @@ class TypeClass;
 class TypeTuple;
 class TypeSlice;
 class TypeNull;
+class TypeNoreturn;
 class TypeTraits;
 class TypeMixin;
+class TypeTag;
 
 class Dsymbol;
 
@@ -176,6 +178,7 @@ class ErrorInitializer;
 class StructInitializer;
 class ArrayInitializer;
 class ExpInitializer;
+class CInitializer;
 
 class Expression;
 class IntegerExp;
@@ -193,6 +196,7 @@ class TupleExp;
 class ArrayLiteralExp;
 class AssocArrayLiteralExp;
 class StructLiteralExp;
+class CompoundLiteralExp;
 class ObjcClassReferenceExp;
 class TypeExp;
 class ScopeExp;
@@ -426,6 +430,7 @@ public:
     virtual void visit(TypeBasic *t) { visit((Type *)t); }
     virtual void visit(TypeError *t) { visit((Type *)t); }
     virtual void visit(TypeNull *t) { visit((Type *)t); }
+    virtual void visit(TypeNoreturn *t) { visit((Type *)t); }
     virtual void visit(TypeVector *t) { visit((Type *)t); }
     virtual void visit(TypeEnum *t) { visit((Type *)t); }
     virtual void visit(TypeTuple *t) { visit((Type *)t); }
@@ -435,6 +440,7 @@ public:
     virtual void visit(TypeQualified *t) { visit((Type *)t); }
     virtual void visit(TypeTraits *t) { visit((Type *)t); }
     virtual void visit(TypeMixin *t) { visit((Type *)t); }
+    virtual void visit(TypeTag *t) { visit((Type *)t); }
 
     // TypeNext
     virtual void visit(TypeReference *t) { visit((TypeNext *)t); }
@@ -571,6 +577,7 @@ public:
     virtual void visit(StructInitializer *i) { visit((Initializer *)i); }
     virtual void visit(ArrayInitializer *i) { visit((Initializer *)i); }
     virtual void visit(VoidInitializer *i) { visit((Initializer *)i); }
+    virtual void visit(CInitializer *i) { visit((Initializer *)i); }
 };
 
 class Visitor : public ParseTimeVisitor
@@ -616,6 +623,7 @@ public:
     virtual void visit(ErrorExp *e) { visit((Expression *)e); }
     virtual void visit(ComplexExp *e) { visit((Expression *)e); }
     virtual void visit(StructLiteralExp *e) { visit((Expression *)e); }
+    virtual void visit(CompoundLiteralExp *e) { visit((Expression *)e); }
     virtual void visit(ObjcClassReferenceExp *e) { visit((Expression *)e); }
     virtual void visit(SymOffExp *e) { visit((SymbolExp *)e); }
     virtual void visit(OverExp *e) { visit((Expression *)e); }
