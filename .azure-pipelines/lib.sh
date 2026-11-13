@@ -2,7 +2,7 @@
 
 CURL_USER_AGENT="DMD-CI $(curl --version | head -n 1)"
 DMD_DIR="$PWD"
-N=$(($(nproc)+1))
+N=$(nproc)
 
 clone() {
     local url="$1"
@@ -34,26 +34,14 @@ download() {
 
 install_host_dmd() {
     if [ ! -f dmd2/README.TXT ]; then
-        download "http://downloads.dlang.org/releases/2.x/${HOST_DMD_VERSION}/dmd.${HOST_DMD_VERSION}.windows.7z" dmd2.7z
+        download "https://downloads.dlang.org/releases/2.x/${HOST_DMD_VERSION}/dmd.${HOST_DMD_VERSION}.windows.7z" dmd2.7z
         7z x dmd2.7z > /dev/null
-        download "http://downloads.dlang.org/other/libcurl-7.65.3-2-WinSSL-zlib-x86-x64.zip" libcurl.zip
+        download "https://downloads.dlang.org/other/libcurl-7.65.3-2-WinSSL-zlib-x86-x64.zip" libcurl.zip
         7z -y x libcurl.zip > /dev/null
     fi
     export PATH="$PWD/dmd2/windows/bin/:$PATH"
     export HOST_DC="$PWD/dmd2/windows/bin/dmd.exe"
     dmd --version
-}
-
-################################################################################
-# Download dmc
-################################################################################
-
-install_host_dmc() {
-    if [ ! -f dm/README.TXT ]; then
-        download "http://downloads.dlang.org/other/dm857c.zip" dmc.zip
-        7z x dmc.zip > /dev/null
-    fi
-    dm/bin/dmc | head -n 1 || true
 }
 
 ################################################################################
@@ -65,7 +53,7 @@ install_grep() {
     mkdir -p "$tools_dir"
     cd "$tools_dir"
     if [ ! -f grep.exe ]; then
-        download "http://downloads.dlang.org/other/grep-3.1.zip" "grep-3.1.zip"
+        download "https://downloads.dlang.org/other/grep-3.1.zip" "grep-3.1.zip"
         unzip "grep-3.1.zip" # contains grep.exe
     fi
     export PATH="${tools_dir}:$PATH"
@@ -87,7 +75,7 @@ clone_repos() {
         local REPO_BRANCH="$SYSTEM_PULLREQUEST_TARGETBRANCH"
     fi
 
-    for proj in druntime phobos; do
+    for proj in phobos; do
         if [ "$REPO_BRANCH" != master ] && [ "$REPO_BRANCH" != stable ] &&
                 ! git ls-remote --exit-code --heads "https://github.com/dlang/$proj.git" "$REPO_BRANCH" > /dev/null; then
             # use master as fallback for other repos to test feature branches
@@ -99,4 +87,3 @@ clone_repos() {
         fi
     done
 }
-

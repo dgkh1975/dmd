@@ -1,0 +1,694 @@
+/**
+ * Common definitions
+ *
+ * Compiler implementation of the
+ * $(LINK2 https://www.dlang.org, D programming language).
+ *
+ * Copyright:   Copyright (C) 1985-1998 by Symantec
+ *              Copyright (C) 2000-2026 by The D Language Foundation, All Rights Reserved
+ * Authors:     $(LINK2 https://www.digitalmars.com, Walter Bright)
+ * License:     $(LINK2 https://www.boost.org/LICENSE_1_0.txt, Boost License 1.0)
+ * Source:      $(LINK2 https://github.com/dlang/dmd/blob/master/compiler/src/dmd/backend/cc.d, backend/_cc.d)
+ */
+
+module dmd.backend.cc;
+
+// Online documentation: https://dlang.org/phobos/dmd_backend_cc.html
+
+import dmd.backend.barray;
+import dmd.backend.cdef;        // host and target compiler definition
+import dmd.backend.x86.code_x86;
+import dmd.backend.dt : dt_t;
+import dmd.backend.el;
+import dmd.backend.symbol;
+import dmd.backend.type;
+
+@nogc:
+nothrow:
+@safe:
+
+uint mskl(uint i) { return 1 << i; }     // convert int to mask
+
+static if (MEMMODELS == 1)
+{
+    enum LARGEDATA = 0;     // don't want 48 bit pointers
+    enum LARGECODE = 0;
+}
+else
+{
+    bool LARGEDATA() { return (config.memmodel & 6) != 0; }
+    bool LARGECODE() { return (config.memmodel & 5) != 0; }
+}
+
+enum IDMAX = 900;              // identifier max (excluding terminating 0)
+enum IDOHD = 4+1+int.sizeof*3; // max amount of overhead to ID added by
+
+alias Funcsym = Symbol;
+
+alias vec_t = size_t*;
+alias enum_TK = ubyte;
+
+__gshared Config config;
+
+
+/////////// Position in source file
+
+struct Srcpos
+{
+nothrow:
+    uint Slinnum;           // 0 means no info available
+    uint Scharnum;          // 0 means no info available
+
+    const(char)* Sfilename;
+
+    static Srcpos create(const(char)* filename, uint linnum, uint charnum)
+    {
+        // Cannot have constructor because Srcpos is used in a union
+        Srcpos sp;
+        sp.Sfilename = filename;
+        sp.Slinnum = linnum;
+        sp.Scharnum = charnum;
+        return sp;
+    }
+
+    void print(const(char)* func) const { Srcpos_print(this, func); }
+}
+
+import dmd.backend.dout : Srcpos_print;
+
+/**********************************
+ * Current 'state' of the compiler.
+ * Used to gather together most global variables.
+ * This struct is saved/restored during function body parsing.
+ */
+
+struct Pstate
+{
+    ubyte STinsizeof;           // !=0 if in a sizeof expression. Useful to
+                                // prevent <array of> being converted to
+                                // <pointer to>.
+
+    Funcsym* STfuncsym_p;       // if inside a function, then this is the
+                                // function Symbol.
+}
+
+__gshared Pstate pstate;        // parser state
+
+@trusted
+void funcsym_p(Funcsym* fp) { pstate.STfuncsym_p = fp; }
+
+@trusted
+Funcsym* funcsym_p() { return pstate.STfuncsym_p; }
+
+/****************************
+ * Global variables.
+ */
+
+struct Cstate
+{
+    symtab_t* CSpsymtab;        // pointer to current Symbol table
+}
+
+__gshared Cstate cstate;        // compiler state
+
+/* Bits for sytab[] that give characteristics of storage classes        */
+enum
+{
+    SCEXP = 1,      // valid inside expressions
+    SCKEP = 2,      // Symbol should be kept even when function is done
+    SCSCT = 4,      // storage class is valid for use in static ctor
+    SCSS  = 8,      // storage class is on the stack
+    SCRD  = 0x10,   // we can do reaching definitions on these
+    SCDATA = 0x20,  // goes in data segment
+}
+
+// Determine if Symbol has a Ssymnum associated with it.
+// (That is, it is allocated on the stack or has live variable analysis
+//  done on it, so it is stack and register variables.)
+//char symbol_isintab(Symbol* s) { return sytab[s.Sclass] & SCSS; }
+
+/******************************************
+ * Basic blocks:
+ *      Basic blocks are a linked list of all the basic blocks
+ *      in a function. startblock heads the list.
+ */
+
+alias ClassDeclaration_ = void*;
+alias Declaration_ = void*;
+alias Module_ = void*;
+
+/*************************************
+ * While constructing a block list, BlockState maintains
+ * the global state needed to construct that list.
+ */
+struct BlockState
+{
+    block* startblock;          // first block in the block list
+    block* curblock;            // the current (i.e. last) block in the list
+    Funcsym* funcsym;           // the function the blocks form the function body of
+    Symbol* context;            // eh (exception handling) frame context variable
+    int scope_index;            // current scope index
+    int next_index;             // value for next scope index
+    BFL flags;                  // value to OR into Bflags
+    block* tryblock;            // current enclosing try block
+    ClassDeclaration_ classdec;
+    Declaration_ member;        // member we're compiling for
+    Module_ _module;            // module we're in
+}
+
+enum BFL : ushort
+{
+    visited       = 1,      // set if block is visited
+    mark          = 2,      // set if block is visited
+    jmpoptdone    = 4,      // set when no more jump optimizations
+                            //  are possible for this block
+    nostackopt    = 8,      // set when stack elimination should not be done
+    separate      = 0x10,   // do not merge with other blocks
+    prolog        = 0x20,   // generate function prolog
+    epilog        = 0x40,   // generate function epilog
+    refparam      = 0x80,   // referenced parameter
+    reflocal      = 0x100,  // referenced local
+    outsideprolog = 0x200,  // outside function prolog/epilog
+    label         = 0x400,  // block preceded by label
+    volatile      = 0x800,  // block is volatile
+    keepRolled    = 0x1000, // do not unroll loop
+
+    // for Windows NTEXCEPTIONS
+    ehcode        = 0x2000, // BC.filter: need to load exception code
+    unwind        = 0x4000, // do local_unwind following block (unused)
+}
+
+struct block
+{
+nothrow:
+    elem* Belem;                // pointer to elem tree
+    block* Bnext;               // pointer to next block in list
+    Barray!(block*) Bsucc;      // and the successor array copy of Bsucc
+    Barray!(block*) Bpred;      // and the predecessor array
+    block* Btry;                // BC.cpptry,BC.try_: enclosing try block, if any
+                                // BC???: if in try-block, points to BC.try_ or BC.try_
+                                // note that can't have a BC.cpptry and BC.try_ in
+                                // the same function.
+    union
+    {
+        long[] Bswitch;                // BC.switch_: case expression values
+
+        struct
+        {
+            regm_t usIasmregs;         // Registers modified
+            ubyte bIasmrefparam;       // References parameters?
+        }
+
+        struct
+        {
+            Symbol* Bcatchtype;       // one type for each catch block
+            Barray!uint* actionTable; // EH_DWARF: indices into typeTable
+        }                             // BC.jcatch
+
+        struct
+        {
+            Symbol* jcatchvar;      // __d_throw() fills in this
+            int Bscope_index;           // index into scope table
+            int Blast_index;            // enclosing index into scope table
+        }                               // BC.try_
+
+        struct
+        {
+            Symbol* flag;               // EH_DWARF: set to 'flag' symbol that encloses finally
+            block* b_ret;               // EH_DWARF: associated BC.finRet block
+        }                               // finally
+
+        // add member mimicking the largest of the other elements of this union, so it can be copied
+        struct _BS { Symbol* jcvar; int Bscope_idx, Blast_idx; }
+        _BS BS;
+    }
+    Srcpos      Bsrcpos;        // line number (0 if not known)
+    BC          bc;             // exit condition
+
+    ubyte       Balign;         // alignment
+
+    BFL         Bflags;         // flags (BFLxxxx)
+    code*       Bcode;          // code generated for this block
+
+    uint        Bweight;        // relative number of times this block
+                                // is executed (optimizer and codegen)
+
+    uint        Bdfoidx;        // index of this block in dfo[]
+    uint        Bnumber;        // sequence number of block
+    union
+    {
+        uint _BLU;              // start of the union
+
+        // CPP
+        struct
+        {
+            uint        Bblknum;        // position of block from startblock
+            Symbol*     Binitvar;       // !=NULL points to an auto variable with
+                                        // an explicit or implicit initializer
+        }
+
+        // OPTIMIZER
+        struct
+        {
+            vec_t       Bdom;           // mask of dominators for this block
+            vec_t       Binrd;
+            vec_t       Boutrd;         // IN and OUT for reaching definitions
+            vec_t       Binlv;
+            vec_t       Boutlv;         // IN and OUT for live variables
+            vec_t       Bin;
+            vec_t       Bout;           // IN and OUT for other flow analyses
+            vec_t       Bgen;
+            vec_t       Bkill;          // pointers to bit vectors used by data
+                                        // flow analysis
+
+            // BC.iftrue can have different vectors for the 2nd successor:
+            vec_t       Bout2;
+            vec_t       Bgen2;
+            vec_t       Bkill2;
+        }
+
+        // CODGEN
+        struct
+        {
+            // For BC.switch_, BC.jmptab
+            targ_size_t Btablesize;     // size of generated table
+            targ_size_t Btableoffset;   // offset to start of table
+            targ_size_t Btablebase;     // offset to instruction pointer base
+
+            targ_size_t Boffset;        // code offset of start of this block
+            targ_size_t Bsize;          // code size of this block
+            con_t       Bregcon;        // register state at block exit
+        }
+    }
+}
+
+/** Basic block control flow operators. **/
+
+enum BC : ubyte
+{
+    none      = 0,
+    goto_     = 1,    // goto Bsucc block
+    iftrue    = 2,    // if (Belem) goto Bsucc[0] else Bsucc[1]
+    ret       = 3,    // return (no return value)
+    retexp    = 4,    // return with return value
+    exit      = 5,    // never reaches end of block (like exit() was called)
+    asm_      = 6,    // inline assembler block (Belem is NULL, Bcode
+                      // contains code generated).
+                      // These blocks have one or more successors in Bsucc,
+                      // never 0
+    switch_   = 7,    // switch statement
+                      // Bswitch points to switch data
+                      // Default is Bsucc
+                      // Cases follow in linked list
+    ifthen    = 8,    // a BC.switch_ is converted to if-then
+                      // statements
+    jmptab    = 9,    // a BC.switch_ is converted to a jump
+                      // table (switch value is index into
+                      // the table)
+    cpptry    = 10,   // C++ try block
+                      // first block in a try-block. The first block in
+                      // Bsucc is the next one to go to, subsequent
+                      // blocks are the catch blocks
+    catch_    = 11,   // C++ catch block
+    jump      = 12,   // Belem specifies (near) address to jump to
+    try_      = 13,   // SEH: first block of try-except or try-finally
+                      // D: try-catch or try-finally
+    filter    = 14,   // SEH exception-filter (always exactly one block)
+    finally_  = 15,   // first block of SEH termination-handler,
+                      // or D finally block
+    finRet    = 16,   // last block of SEH termination-handler or D finally_ block
+    except    = 17,   // first block of SEH exception-handler
+    jcatch    = 18,   // D catch block
+    lpad      = 19,   // EH_DWARF: landing pad for BC._except
+}
+
+/********************************
+ * Range for blocks.
+ */
+struct BlockRange
+{
+  pure nothrow @nogc:
+
+    this(block* b)
+    {
+        this.b = b;
+    }
+
+    block* front() return  { return b; }
+    void popFront() { b = b.Bnext; }
+    bool empty() const { return !b; }
+
+  private:
+    block* b;
+}
+
+/**********************************
+ * Functions
+ */
+
+alias func_flags_t = uint;
+enum
+{
+    Fpending         =          1, // if function has been queued for being written
+    Foutput          =          2, // if function has been written out
+    Finline          =          4, // if SCinline, and function really is inline
+    Fctor            =          8, // if function is a constructor
+    Fdtor            =       0x10, // if function is a destructor
+    Finlinenest      =       0x20, // used as a marker to prevent nested
+                                   // inlines from expanding
+    Fstatic          =       0x40, // static member function (no this)
+    Fpure            =       0x80, // pure function
+    Finvariant       =      0x100, // __invariant function
+    Fvtblgen         =      0x200, // generate vtbl[] when this function is defined
+    Fcppeh           =      0x400, // uses C++ EH
+    Fnteh            =      0x800, // uses NT Structured EH
+    Fmark            =     0x1000, // has unbalanced OPctor's
+    Fdoinline        =     0x2000, // do inline walk
+    Foverridden      =     0x4000, // ignore for overriding purposes
+    Fjmonitor        =     0x8000, // Mars synchronized function
+    Fnosideeff       =   0x1_0000, // function has no side effects
+    Fmain            =   0x2_0000, // function is D main
+    Fnested          =   0x4_0000, // D nested function with 'this'
+    Fmember          =   0x8_0000, // D member function with 'this'
+    Fnotailrecursion =  0x10_0000, // no tail recursion optimizations
+    Ffakeeh          =  0x20_0000, // allocate space for NT EH context sym anyway
+    Fnothrow         =  0x40_0000, // function does not throw (even if not marked 'nothrow')
+    Feh_none         =  0x80_0000, // ehmethod==EH_NONE for this function only
+    F3hiddenPtr      = 0x100_0000, // function has hidden pointer to return value
+    F3safe           = 0x200_0000, // function is @safe
+    Fhasframe        = 0x400_0000, // function has standard stack frame
+}
+
+struct func_t
+{
+    block* Fstartblock;         // list of blocks comprising function
+    symtab_t Flocsym;           // local Symbol table
+    Srcpos Fstartline;          // starting line # of function
+    Srcpos Fendline;            // line # of closing brace of function
+    func_flags_t Fflags;
+
+    Classsym* Fclass;           // if member of a class, this is the class
+                                // (I think this is redundant with Sscope)
+
+    char* Fredirect;            // redirect function name to this name in object
+
+    // Array of catch types for EH_DWARF Types Table generation
+    Barray!(Symbol*) typesTable;
+
+    union
+    {
+        uint LSDAoffset;        // ELFOBJ: offset in LSDA segment of the LSDA data for this function
+        Symbol* LSDAsym;        // MACHOBJ: GCC_except_table%d
+    }
+}
+
+/************************************
+ * Base classes are a list of these.
+ */
+
+struct baseclass_t
+{
+    Classsym*         BCbase;           // base class Symbol
+    baseclass_t*      BCnext;           // next base class
+    targ_size_t       BCoffset;         // offset from start of derived class to this
+}
+
+/***********************************
+ * Special information for enums.
+ */
+
+alias enum_flags_t = uint;
+enum
+{
+    SENnotagname  = 1,       // no tag name for enum
+    SENforward    = 2,       // forward referenced enum
+}
+
+struct enum_t
+{
+    enum_flags_t SEflags;
+    Barray!(Symbol*) SEenums;   // all members of enum
+}
+
+/***********************************
+ * Special information for structs.
+ */
+
+alias struct_flags_t = uint;
+enum
+{
+    STRanonymous     = 1,          // set for unions with no tag names
+    STRglobal        = 2,          // defined at file scope
+    STRnotagname     = 4,          // struct/class with no tag name
+    STRoutdef        = 8,          // we've output the debug definition
+    STRbitfields     = 0x10,       // set if struct contains bit fields
+    STRunion         = 0x2000,     // actually, it's a union
+    STRclass         = 0x4000,     // it's a class, not a struct
+    STR0size         = 0x20000,    // zero sized struct
+    STRnotpod        = 0x200000,   // struct is not POD
+}
+
+struct struct_t
+{
+    targ_size_t Sstructsize;    // size of struct
+    Barray!(Symbol*) Sfields;   // all members of struct
+    Symbol* Sroot;              // root of binary tree Symbol table
+    uint Salignsize;            // size of struct for alignment purposes
+    ubyte Sstructalign;         // struct member alignment in effect
+    struct_flags_t Sflags;
+    baseclass_t* Sbase;         // list of direct base classes
+
+    // For 64 bit Elf function ABI
+    type* Sarg1type;
+    type* Sarg2type;
+}
+
+enum
+{
+    SFLvalue        = 1,           // Svalue contains const expression
+    SFLimplem       = 2,           // if seen implementation of Symbol
+                                   // (function body for functions,
+                                   // initializer for variables)
+    SFLdouble       = 2,           // SCregpar or SCparameter, where float
+                                   // is really passed as a double
+    SFLfree         = 4,           // if we can symbol_free() a Symbol in
+                                   // a Symbol table[]
+    SFLmark         = 8,           // temporary marker
+    SFLexit         = 0x10,        // tyfunc: function does not return
+                                   // (ex: exit,abort,_assert,longjmp)
+    SFLtrue         = 0x200,       // value of Symbol != 0
+    SFLreplace      = SFLmark,     // variable gets replaced in inline expansion
+    SFLskipinit     = 0x10000,     // SCfield, SCmember: initializer is skipped
+    SFLnodebug      = 0x20000,     // don't generate debug info
+    SFLwasstatic    = 0x800000,    // was an uninitialized static
+    SFLweak         = 0x1000000,   // resolve to NULL if not found
+    SFLhidden       = 0x2000000,   // SC.static_/SC.global: not visible outside of DSOs (-fvisibility=hidden)
+                                   // SC.parameter: hidden return value parameter
+    SFLartifical    = 0x4000000,   // compiler generated symbol
+    SFLnounderscore = 0x8000_0000, // don't prepend an _ to identifiers in object file
+
+    // CPP
+    SFLnodtor       = 0x10,        // set if destructor for Symbol is already called
+    SFLdtorexp      = 0x80,        // Svalue has expression to tack onto dtor
+    SFLmutable      = 0x100000,    // SCmember or SCfield is mutable
+    SFLdyninit      = 0x200000,    // symbol has dynamic initializer
+    SFLtmp          = 0x400000,    // symbol is a generated temporary
+    SFLthunk        = 0x40000,     // symbol is temporary for thunk
+
+    // Possible values for visibility bits
+    SFLprivate      = 0x60,
+    SFLprotected    = 0x40,
+    SFLpublic       = 0x20,
+    SFLnone         = 0x00,
+    SFLpmask        = 0x60,        // mask for the visibility bits
+
+    SFLvtbl         = 0x2000,      // VEC_VTBL_LIST: Symbol is a vtable or vbtable
+    SFLimported     = 0x200000,    // symbol is in another DSO (D only, SFLdyninit unused)
+
+    // OPTIMIZER and CODGEN
+    GTregcand       = 0x100,       // if Symbol is a register candidate
+    SFLdead         = 0x800,       // this variable is dead
+    GTunregister    = 0x8000000,   // 'unregister' a previous register assignment
+
+    // OPTIMIZER only
+    SFLdistinct      = 0x400,       // only accessible by unambiguous reference,
+                                   // i.e. cannot be addressed via pointer
+                                   // (GTregcand is a subset of this)
+                                   // P.S. code generator turns off this
+                                   // flag if any reads are done from it.
+                                   // This is to eliminate stores to it
+                                   // that are never read.
+    SFLlivexit      = 0x1000,      // live on exit from function
+    SFLnotbasiciv   = 0x4000,      // not a basic induction variable
+    SFLnord         = SFLdouble,   // SCauto,SCregister,SCtmp: disallow redundant warnings
+
+    // CODGEN only
+    GTtried         = SFLmark,     // tried to place in register
+    GTbyte          = 0x8000,      // variable is sometimes accessed as
+    SFLread         = 0x40000,     // variable is actually read from
+                                   // (to eliminate dead stores)
+    SFLspill        = 0x80000,     // only in register part of the time
+}
+
+public import dmd.backend.symbol : Symbol_Salignsize, Symbol_Sisdead, Symbol_isAffected;
+
+
+// Class, struct or union
+
+alias Classsym = Symbol;
+
+// Namespace Symbol
+alias Nspacesym = Symbol;
+
+// Alias for another Symbol
+alias Aliassym = Symbol;
+
+// Function symbol
+//alias Funcsym = Symbol;
+
+// Determine if this Symbol is stored in a COMDAT
+//#if MARS
+//#define symbol_iscomdat(s)      ((s)->Sclass == SCcomdat ||             \
+//        config.flags2 & CFG2comdat && (s)->Sclass == SCinline ||        \
+//        config.flags4 & CFG4allcomdat && ((s)->Sclass == SCglobal))
+//#else
+//#define symbol_iscomdat(s)      ((s)->Sclass == SCcomdat ||             \
+//        config.flags2 & CFG2comdat && (s)->Sclass == SCinline ||        \
+//        config.flags4 & CFG4allcomdat && ((s)->Sclass == SCglobal || (s)->Sclass == SCstatic))
+//#endif
+
+/* Format the identifier for presentation to the user   */
+const(char)* prettyident(const Symbol* s) { return &s.Sident[0]; }
+
+
+/**********************************
+ * Function parameters:
+ *      Pident          identifier of parameter
+ *      Ptype           type of argument
+ *      Psym            symbol corresponding to Pident when using the
+ *                      parameter list as a symbol table
+ */
+
+alias pflags_t = uint;
+
+/************************
+ * Params:
+ *      f = function symbol
+ * Returns:
+ *      exception method for f
+ */
+@trusted
+EHmethod ehmethod(Symbol* f)
+{
+    return f.Sfunc.Fflags & Feh_none ? EHmethod.EH_NONE : config.ehmethod;
+}
+
+
+struct param_t
+{
+nothrow:
+    debug ushort      id;
+    enum IDparam = 0x7050;
+
+    char* Pident;               // identifier
+    type* Ptype;                // type of parameter (NULL if not known yet)
+    param_t* Pnext;             // next in list
+
+    // number of parameters in list
+    uint length() { return param_t_length(&this); }
+
+    // print this param_t
+    void print() { param_t_print(&this); }
+
+    // print this list of param_t's
+    void print_list() { param_t_print_list(&this); }
+}
+
+void param_debug(const param_t* p)
+{
+    debug assert(p.id == p.IDparam);
+}
+
+/**************************************
+ * Element types.
+ * These should be combined with storage classes.
+ */
+
+enum FL : ubyte
+{
+    unde,
+    const_,       // numerical constant
+    oper,         // operator node
+    func,         // function symbol
+    data,         // ref to data segment variable
+    reg,          // ref to register variable
+    pseudo,       // pseuodo register variable
+    auto_,        // ref to automatic variable
+    fast,         // ref to variable passed as register
+    para,         // ref to function parameter variable
+    extern_,      // ref to external variable
+    code,         // offset to code
+    block,        // offset to block
+    udata,        // ref to udata segment variable
+    cs,           // ref to common subexpression number
+    switch_,      // ref to offset of switch data block
+    fltreg,       // ref to floating reg on stack, int contains offset
+    offset,       // offset (a variation on constant, needed so we
+                  // can add offsets (different meaning for FL.const_))
+    datseg,       // ref to data segment offset
+    ctor,         // constructed object
+    dtor,         // destructed object
+    regsave,      // ref to saved register on stack, int contains offset
+    asm_,         // (code) an ASM code
+
+    ndp,          // saved 8087 register
+
+    // Segmented systems
+    fardata,      // ref to far data segment
+    csdata,       // ref to code segment variable
+
+    localsize,    // replaced with # of locals in the stack frame
+    tlsdata,      // thread local storage
+    bprel,        // ref to variable at fixed offset from frame pointer
+    framehandler, // ref to C++ frame handler for NT EH
+    blockoff,     // address of block
+    allocatmp,    // temp for built-in alloca()
+    stack,        // offset from ESP rather than EBP
+    dsymbol,      // it's a Dsymbol
+
+    // Global Offset Table
+    got,          // global offset table entry outside this object file
+    gotoff,       // global offset table entry inside this object file
+
+    funcarg,      // argument to upcoming function call
+}
+
+////////// Srcfiles
+
+
+/**************************************************
+ * This is to support compiling expressions within the context of a function.
+ */
+
+struct EEcontext
+{
+    byte EEcompile;             // we're compiling for the EE expression
+    byte EEin;                  // we are parsing an EE expression
+    elem* EEelem;               // compiled version of EEexpr
+    Symbol* EEfunc;             // function expression is in
+    code* EEcode;               // generated code
+}
+
+public import dmd.backend.ee : eecontext;
+
+// Different goals for el_optimize()
+enum Goal : uint
+{
+    none        = 0,       // evaluate for side effects only
+    value       = 1,       // evaluate for value
+    flags       = 2,       // evaluate for flags
+    again       = 4,
+    struct_     = 8,
+    handle      = 0x10,    // don't replace handle'd objects
+    ignoreExceptions = 0x20, // ignore floating point exceptions
+}

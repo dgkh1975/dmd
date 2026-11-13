@@ -1,0 +1,18 @@
+// PERMUTE_ARGS:
+// REQUIRED_ARGS: -D -Dd${RESULTS_DIR}/compilable -o-
+// POST_SCRIPT: compilable/extra-files/ddocAny-postscript.sh
+// EXTRA_SOURCES: extra-files/ddoc_minimal.ddoc
+
+///
+interface A
+{
+	///
+	static void staticHello() { }
+
+	///
+	final void hello() { }
+}
+
+void main()
+{
+}

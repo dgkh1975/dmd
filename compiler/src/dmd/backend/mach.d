@@ -1,0 +1,580 @@
+/**
+ * Mach-O object file format
+ *
+ * Translated to D from mach.h
+ */
+
+module dmd.backend.mach;
+
+// Online documentation: https://dlang.org/phobos/dmd_backend_mach.html
+// location of system .h files on Mac: xcrun --show-sdk-path
+// location of machine.h: usr/include/mach
+// https://alexdremov.me/mystery-of-mach-o-object-file-builders/
+
+@safe:
+
+alias cpu_type_t = int;
+alias cpu_subtype_t = int;
+alias vm_prot_t = int;
+
+enum
+{
+    // magic
+    MH_MAGIC    = 0xfeedface,
+    MH_MAGIC_64 = 0xfeedfacf,
+    MH_CIGAM    = 0xcefaedfe,
+    MH_CIGAM_64 = 0xcffaedfe,
+
+    // cputype
+    CPU_TYPE_I386      = cast(cpu_type_t)7,
+    CPU_TYPE_X86_64    = cast(cpu_type_t)7 | 0x100_0000,
+    CPU_TYPE_POWERPC   = cast(cpu_type_t)18,
+    CPU_TYPE_POWERPC64 = CPU_TYPE_POWERPC | 0x100_0000,
+    CPU_TYPE_ARM       = cast(cpu_type_t)12,
+    CPU_TYPE_ARM64     = CPU_TYPE_ARM | 0x100_0000,
+
+    // cpusubtype
+    CPU_SUBTYPE_POWERPC_ALL = cast(cpu_subtype_t)0,
+    CPU_SUBTYPE_ARM64_ALL   = cast(cpu_subtype_t)0,
+    CPU_SUBTYPE_I386_ALL    = cast(cpu_subtype_t)3,
+
+    // filetype
+    MH_OBJECT       = 1,
+    MH_EXECUTE      = 2,
+    MH_BUNDLE       = 8,
+    MH_DYLIB        = 6,
+    MH_PRELOAD      = 5,
+    MH_CORE         = 4,
+    MH_DYLINKER     = 7,
+    MH_DSYM         = 10,
+
+    // flags
+    MH_NOUNDEFS                = 1,
+    MH_INCRLINK                = 2,
+    MH_DYLDLINK                = 4,
+    MH_TWOLEVEL                = 0x80,
+    MH_BINDATLOAD              = 8,
+    MH_PREBOUND                = 0x10,
+    MH_PREBINDABLE             = 0x800,
+    MH_NOFIXPREBINDING         = 0x400,
+    MH_ALLMODSBOUND            = 0x1000,
+    MH_CANONICAL               = 0x4000,
+    MH_SPLIT_SEGS              = 0x20,
+    MM_LAZY_INIT               = 0x40,
+    MH_FORCE_FLAT              = 0x100,
+    MH_SUBSECTIONS_VIA_SYMBOLS = 0x2000,
+    MH_NOMULTIDEFS             = 0x200,
+    MH_WEAK_DEFINES            = 0x8000,
+    MH_BINDS_TO_WEAK           = 0x10000,
+    MH_ALLOW_STACK_EXECUTION   = 0x20000,
+    MH_ROOT_SAFE               = 0x40000,
+    MH_SETUID_SAFE             = 0x80000,
+    MH_NO_REEXPORTED_DYLIBS    = 0x100000,
+    MH_PIE                     = 0x200000,
+    MH_DEAD_STRIPPABLE_DYLIB   = 0x400000,
+    MH_HAS_TLV_DESCRIPTORS     = 0x800000,
+    MH_NO_HEAP_EXECUTION       = 0x1000000,
+    MH_APP_EXTENSION_SAFE      = 0x2000000,
+    MH_NLIST_OUTOFSYNC_WITH_DYLDINFO = 0x4000000,
+    MH_SIM_SUPPORT             = 0x8000000,
+    MH_IMPLICIT_PAGEZERO       = 0x10000000,
+    MH_DYLIB_IN_CACHE          = 0x80000000,
+}
+
+struct mach_header
+{
+    uint magic;
+    cpu_type_t cputype;
+    cpu_subtype_t cpusubtype;
+    uint filetype;
+    uint ncmds;
+    uint sizeofcmds;
+    uint flags;
+}
+
+struct mach_header_64
+{
+    uint magic;
+    cpu_type_t cputype;
+    cpu_subtype_t cpusubtype;
+    uint filetype;
+    uint ncmds;
+    uint sizeofcmds;
+    uint flags;
+    uint reserved;
+}
+
+enum
+{
+    // cmd
+    LC_SEGMENT      = 1,
+    LC_SYMTAB       = 2,
+    LC_SYMSEG       = 3,
+    LC_THREAD       = 4,
+    LC_UNIXTHREAD   = 5,
+    LC_LOADFMVLIB   = 6,
+    LC_IDFVMLIB     = 7,
+    LC_IDENT        = 8,
+    LC_FVMFILE      = 9,
+    LC_PREPAGE      = 10,
+    LC_DYSYMTAB     = 11,
+    LC_LOAD_DYLIB   = 12,
+    LC_ID_DYLIB     = 13,
+    LC_ID_DYLINKER  = 15,
+    LC_PREBOUND_DYLIB = 0x10,
+    LC_ROUTINES       = 0x11,
+    LC_SUB_FRAMEWORK  = 0x12,
+    LC_SUB_UMBRELLA   = 0x13,
+    LC_SUB_CLIENT     = 0x14,
+    LC_SUB_LIBRARY    = 0x15,
+    LC_TWOLEVEL_HINTS = 0x16,
+    LC_PREBIND_CKSUM  = 0x17,
+    LC_SEGMENT_64     = 0x19,
+
+    /// Build for MacOSX min OS version.
+    LC_VERSION_MIN_MACOSX = 0x24,
+
+    /// Build for platform min OS version.
+    LC_BUILD_VERSION = 0x32,
+}
+
+struct load_command
+{
+    uint cmd;
+    uint cmdsize;
+}
+
+struct uuid_command
+{
+    uint cmd;
+    uint cmdsize;
+    ubyte[16] uuid;
+}
+
+enum
+{
+    // flags
+    SG_HIGHVM              = 1,
+    SG_FVMLIB              = 2,
+    SG_NORELOC             = 4,
+    SG_PROTECTED_VERSION_1 = 8,
+}
+
+struct segment_command
+{
+    uint cmd;
+    uint cmdsize;
+    char[16] segname = 0;
+    uint vmaddr;
+    uint vmsize;
+    uint fileoff;
+    uint filesize;
+    vm_prot_t maxprot;
+    vm_prot_t initprot;
+    uint nsects;
+    uint flags;
+}
+
+struct segment_command_64
+{
+    uint cmd;
+    uint cmdsize;
+    char[16] segname = 0;
+    ulong vmaddr;
+    ulong vmsize;
+    ulong fileoff;
+    ulong filesize;
+    vm_prot_t maxprot;
+    vm_prot_t initprot;
+    uint nsects;
+    uint flags;
+}
+
+enum
+{
+    // flags
+    SECTION_TYPE       = 0xFF,
+    SECTION_ATTRIBUTES = 0xFFFFFF00,
+
+    S_REGULAR               = 0,
+    S_ZEROFILL              = 1,
+    S_CSTRING_LITERALS      = 2,
+    S_4BYTE_LITERALS        = 3,
+    S_8BYTE_LITERALS        = 4,
+    S_LITERAL_POINTERS      = 5,
+
+    S_NON_LAZY_SYMBOL_POINTERS      = 6,
+    S_LAZY_SYMBOL_POINTERS          = 7,
+    S_SYMBOL_STUBS                  = 8,
+    S_MOD_INIT_FUNC_POINTERS        = 9,
+    S_MOD_TERM_FUNC_POINTERS        = 10,
+    S_COALESCED                     = 11,
+    S_GB_ZEROFILL                   = 12,
+    S_INTERPOSING                   = 13,
+    S_16BYTE_LITERALS               = 14,
+    S_DTRACE_DOF                    = 15,
+
+    S_LAZY_DYLIB_SYMBOL_POINTERS    = 0x10,
+    S_THREAD_LOCAL_REGULAR          = 0x11, // template of initial values for TLVs
+    S_THREAD_LOCAL_ZEROFILL         = 0x12, // template of initial values for TLVs
+    S_THREAD_LOCAL_VARIABLES        = 0x13, // TLV descriptors
+    S_THREAD_LOCAL_VARIABLE_POINTERS = 0x14,
+    S_THREAD_LOCAL_INIT_FUNCTION_POINTERS = 0x15,
+    S_INIT_FUNC_OFFSETS              = 0x16,
+
+    SECTION_ATTRIBUTES_USR          = 0xFF000000,
+    S_ATTR_PURE_INSTRUCTIONS        = 0x80000000,
+    S_ATTR_NO_TOC                   = 0x40000000,
+    S_ATTR_STRIP_STATIC_SYMS        = 0x20000000,
+    S_ATTR_NO_DEAD_STRIP            = 0x10000000,
+    S_ATTR_LIVE_SUPPORT             = 0x8000000,
+    S_ATTR_SELF_MODIFYING_CODE      = 0x4000000,
+    S_ATTR_DEBUG                    = 0x2000000,
+
+    SECTION_ATTRIBUTES_SYS          = 0xFFFF00,
+    S_ATTR_SOME_INSTRUCTIONS        = 0x000400,
+    S_ATTR_EXT_RELOC                = 0x000200,
+    S_ATTR_LOC_RELOC                = 0x000100,
+}
+
+struct section
+{
+    char[16] sectname;
+    char[16] segname;
+    uint addr;
+    uint size;
+    uint offset;
+    uint _align;
+    uint reloff;
+    uint nreloc;
+    uint flags;
+
+    uint reserved1;
+    uint reserved2;
+}
+
+struct section_64
+{
+    char[16] sectname;
+    char[16] segname;
+    ulong addr;  // logical location of section
+    ulong size;
+    uint offset; // offset from start of object file to section contents
+                 // for ZERO_FILL this must be 0
+    uint _align;
+    uint reloff; // file offset of relocation entries
+    uint nreloc;
+    uint flags;
+    uint reserved1;
+    uint reserved2;
+    uint reserved3;
+}
+
+struct twolevel_hints_command
+{
+    uint cmd;
+    uint cmdsize;
+    uint offset;
+    uint nhints;
+}
+
+struct twolevel_hint
+{
+    version (all)
+    {
+        uint xxx;
+    }
+    else
+    {
+        // uint isub_image:8, itoc:24;
+    }
+}
+
+struct symtab_command
+{
+    uint cmd;
+    uint cmdsize;
+    uint symoff;
+    uint nsyms;
+    uint stroff;
+    uint strsize;
+}
+
+enum
+{
+    // n_type
+    N_EXT   = 1,
+    N_STAB  = 0xE0,
+    N_PEXT  = 0x10,
+    N_TYPE  = 0x0E,
+    N_UNDF  = 0,
+    N_ABS   = 2,
+    N_INDR  = 10,
+    N_PBUD  = 12,
+    N_SECT  = 14,
+}
+
+enum
+{
+    // n_desc
+    N_ARM_THUMB_DEF   =     8,
+    N_NO_DEAD_STRIP   =  0x20,
+    N_DESC_DISCARDED  =  0x20,
+    N_WEAK_REF        =  0x40,
+    N_WEAK_DEF        =  0x80,
+    N_REF_TO_WEAK     =  0x80,
+    N_SYMBOL_RESOLVER = 0x100,
+}
+
+enum
+{
+    // n_desc
+    REFERENCE_FLAG_UNDEFINED_NON_LAZY         = 0,
+    REFERENCE_FLAG_UNDEFINED_LAZY             = 1,
+    REFERENCE_FLAG_DEFINED                    = 2,
+    REFERENCE_FLAG_PRIVATE_DEFINED            = 3,
+    REFERENCE_FLAG_PRIVATE_UNDEFINED_NON_LAZY = 4,
+    REFERENCE_FLAG_PRIVATE_UNDEFINED_LAZY     = 5,
+}
+
+struct nlist
+{
+    union
+    {
+        int n_strx;
+    }
+    ubyte n_type;
+    ubyte n_sect;
+    short n_desc;
+    uint n_value;
+}
+
+struct nlist_64
+{
+    union
+    {
+        uint n_strx;
+    }
+    ubyte n_type;
+    ubyte n_sect;
+    ushort n_desc;
+    ulong n_value; // N_SECT: address within its section, not the offset from the section start
+                   // N_UNDF: 0
+                   //       : number of bytes for a common symbol
+                   // N_ABS : the value of the symbol; no relocation
+                   // N_STAB: !=0 meaning depends on STABS record
+}
+
+struct dysymtab_command
+{
+    uint cmd;
+    uint cmdsize;
+    uint ilocalsym;
+    uint nlocalsym;
+    uint iextdefsym;
+    uint nextdefsym;
+    uint iundefsym;
+    uint nundefsym;
+    uint tocoff;
+    uint ntoc;
+    uint modtaboff;
+    uint nmodtab;
+    uint extrefsymoff;
+    uint nextrefsyms;
+    uint indirectsymoff;
+    uint nindirectsyms;
+    uint extreloff;
+    uint nextrel;
+    uint locreloff;
+    uint nlocrel;
+}
+
+enum
+{
+    // r_address
+    R_SCATTERED = 0x80000000,
+
+    // r_type
+    // for i386
+    GENERIC_RELOC_VANILLA               = 0,
+    GENERIC_RELOC_PAIR                  = 1,
+    GENERIC_RELOC_SECTDIFF              = 2,
+    GENERIC_RELOC_PB_LA_PTR             = 3,
+    GENERIC_RELOC_LOCAL_SECTDIFF        = 4,
+
+    // for x86_64
+    X86_64_RELOC_UNSIGNED               = 0,
+    X86_64_RELOC_SIGNED                 = 1,
+    X86_64_RELOC_BRANCH                 = 2,
+    X86_64_RELOC_GOT_LOAD               = 3,
+    X86_64_RELOC_GOT                    = 4,
+    X86_64_RELOC_SUBTRACTOR             = 5,
+    X86_64_RELOC_SIGNED_1               = 6,
+    X86_64_RELOC_SIGNED_2               = 7,
+    X86_64_RELOC_SIGNED_4               = 8,
+    X86_64_RELOC_TLV                    = 9, // for thread local variables
+
+    // for ARM64
+    ARM64_RELOC_UNSIGNED                = 0,
+    ARM64_RELOC_SUBTRACTOR              = 1,
+    ARM64_RELOC_BRANCHY26               = 2,
+    ARM64_RELOC_PAGE21                  = 3,
+    ARM64_RELOC_PAGEOFF12               = 4,
+    ARM64_RELOC_GOT_LOAD_PAGE21         = 5,
+    ARM64_RELOC_GOT_LOAD_PAGEOFF12      = 6,
+    ARM64_RELOC_POINTER_TO_GOT          = 7,
+    ARM64_RELOC_TLVP_LOAD_PAGE21        = 8,
+    ARM64_RELOC_TLVP_LOAD_PAGEOFF12     = 9,
+    ARM64_RELOC_ADDEND                  = 10,
+    ARM64_RELOC_AUTHENTICATED_POINTER   = 11,
+}
+
+struct relocation_info  // https://developer.apple.com/documentation/kernel/relocation_info
+{
+    int r_address;      // offset from the section start to the item to be relocated
+
+    /* LITTLE_ENDIAN for x86
+     * uint r_symbolnum:24,  // if r_extern is 1, then index into the symbol table
+     *                       // if r_extern is 0, then ordinal number of the section
+     *      r_pcrel    :1,   // one means PC-relative, 0 means absolute
+     *      r_length   :2,   // 0: 1 byte, 1: 2 bytes, 2: sizeof(long) bytes, 3: 8 bytes
+     *      r_extern   :1,   // see r_symbolnum
+     *      r_type     :4;   // ARM64_RELOC_xxxxx, X86_64_RELOC_xxxxx
+     */
+    uint xxx;
+    nothrow:
+    void r_symbolnum(uint r) { assert(!(r & ~0x00FF_FFFF)); xxx = (xxx & ~0x00FF_FFFF) | r; }
+    void r_pcrel    (uint r) { assert(!(r & ~1));           xxx = (xxx & ~0x0100_0000) | (r << 24); }
+    void r_length   (uint r) { assert(!(r & ~3));           xxx = (xxx & ~0x0600_0000) | (r << (24 + 1)); }
+    void r_extern   (uint r) { assert(!(r & ~1));           xxx = (xxx & ~0x0800_0000) | (r << (24 + 1 + 2)); }
+    void r_type     (uint r) { assert(!(r & ~0xF));         xxx = (xxx & ~0xF000_0000) | (r << (24 + 1 + 2 + 1)); }
+
+    uint r_symbolnum() { return (xxx & 0x00FF_FFFF); }
+    uint r_pcrel    () { return (xxx >> 24) &   1; }
+    uint r_length   () { return (xxx >> 25) &   3; }
+    uint r_extern   () { return (xxx >> 27) &   1; }
+    uint r_type     () { return (xxx >> 28) & 0xF; }
+}
+
+struct scattered_relocation_info
+{
+    /* LITTLE_ENDIAN for x86
+     * uint r_address  :24,
+     *      r_type     :4,
+     *      r_length   :2,
+     *      r_pcrel    :1,
+     *      r_scattered:1;
+     */
+    uint xxx;
+    nothrow:
+    void r_address  (uint r) { assert(!(r & ~0x00FF_FFFF)); xxx = (xxx & ~0x00FF_FFFF) | r; }
+    void r_type     (uint r) { assert(!(r & ~0xF));         xxx = (xxx & ~0x0F00_0000) | (r << 24); }
+    void r_length   (uint r) { assert(!(r & ~3));           xxx = (xxx & ~0x3000_0000) | (r << (24 + 4)); }
+    void r_pcrel    (uint r) { assert(!(r & ~1));           xxx = (xxx & ~0x4000_0000) | (r << (24 + 4 + 2)); }
+    void r_scattered(uint r) { assert(!(r & ~1));           xxx = (xxx & ~0x8000_0000) | (r << (24 + 4 + 2 + 1)); }
+
+    uint r_pcrel() { return (xxx >> (24 + 4 + 2)) & 1; }
+
+    int r_value;
+}
+
+/**
+ * The version_min_command contains the min OS version on which this binary was
+ * built to run.
+ */
+struct version_min_command
+{
+    ///
+    uint cmd = LC_VERSION_MIN_MACOSX;
+
+    ///
+    uint cmdsize = typeof(this).sizeof;
+
+    /// X.Y.Z is encoded in nibbles xxxx.yy.zz
+    uint version_;
+
+    /// X.Y.Z is encoded in nibbles xxxx.yy.zz
+    uint sdk = 0;
+}
+
+/**
+ * The `build_version_command` contains the min OS version on which this binary
+ * was built to run for its platform.
+ */
+struct build_version_command
+{
+    ///
+    uint cmd = LC_BUILD_VERSION;
+
+    ///
+    uint cmdsize = typeof(this).sizeof;
+
+    /// Platform
+    uint platform = PLATFORM_MACOS;
+
+    /// X.Y.Z is encoded in nibbles xxxx.yy.zz
+    uint minos;
+
+    /// X.Y.Z is encoded in nibbles xxxx.yy.zz
+    uint sdk = 0;
+
+    /// Number of tool entries following this
+    uint ntools = 0;
+}
+
+/// Known values for the platform field in `build_version_command`
+enum
+{
+    PLATFORM_MACOS = 1,
+    PLATFORM_IOS = 2,
+    PLATFORM_TVOS = 3,
+    PLATFORM_WATCHOS = 4,
+    PLATFORM_BRIDGEOS = 5,
+    PLATFORM_MACCATALYST = 6,
+    PLATFORM_IOSSIMULATOR = 7,
+    PLATFORM_TVOSSIMULATOR = 8,
+    PLATFORM_WATCHOSSIMULATOR = 9,
+    PLATFORM_DRIVERKIT = 10
+}
+
+// https://github.com/llvm/llvm-project/blob/main/libunwind/include/mach-o/compact_unwind_encoding.h
+
+struct compact_unwind_entry
+{
+    ulong functionAddress;
+    uint functionLength;
+    uint encoding;
+    ulong personality;
+    ulong lsda;
+}
+
+static assert(compact_unwind_entry.sizeof == 32);
+
+// masks for compact_unwind_entry.encoding:
+
+enum : uint
+{
+    UNWIND_IS_NOT_FUNCTION_START     = 0x8000_0000,
+    UNWIND_HAS_LSDA                  = 0x4000_0000,
+    UNWIND_PERSONALITY_MASK          = 0x3000_0000,
+    UNWIND_ARM64_MODE_MASK           = 0x0F00_0000,
+    UNWIND_ARM64_MODE_FRAMELESS      = 0x0200_0000,
+    UNWIND_ARM64_MODE_DWARF          = 0x0300_0000,
+    UNWIND_ARM64_MODE_FRAME          = 0x0400_0000,
+    UNWIND_ARM64_MODE_FRAME_PAUTH_LR = 0x0500_0000,
+}
+
+// Callee-saved register pairs
+
+enum : uint
+{
+    X19_X20 = 1,
+    X21_X22 = 2,
+    X23_X24 = 4,
+    X25_X26 = 8,
+    X27_X28 = 0x10,
+    D8_D9   = 0x100,
+    D10_D11 = 0x200,
+    D12_D13 = 0x400,
+    D14_D15 = 0x800,
+}

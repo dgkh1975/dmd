@@ -1,0 +1,3896 @@
+/**
+ * Generate Mach-O object files.
+ * Does 64 bit X86_64 and 64 bit AArch64.
+ * 32 bit X86_64 is more or less abandoned.
+ *
+ * Compiler implementation of the
+ * $(LINK2 https://www.dlang.org, D programming language).
+ *
+ * Copyright:   Copyright (C) 2009-2026 by The D Language Foundation, All Rights Reserved
+ * Authors:     $(LINK2 https://www.digitalmars.com, Walter Bright)
+ * License:     $(LINK2 https://www.boost.org/LICENSE_1_0.txt, Boost License 1.0)
+ * Source:      $(LINK2 https://github.com/dlang/dmd/blob/master/compiler/src/dmd/backend/machobj.d, backend/machobj.d)
+ */
+
+module dmd.backend.machobj;
+
+import core.stdc.ctype;
+import core.stdc.stdint;
+import core.stdc.stdio;
+import core.stdc.stdlib;
+import core.stdc.string;
+
+import dmd.backend.barray;
+import dmd.backend.cc;
+import dmd.backend.cdef;
+import dmd.backend.code;
+import dmd.backend.arm.instr;
+import dmd.backend.x86.code_x86;
+import dmd.backend.mem;
+import dmd.backend.aarray;
+import dmd.backend.el;
+import dmd.backend.global : _align, err_nomem, error, symboldata;
+import dmd.backend.dout : alignOffset;
+import dmd.backend.obj;
+import dmd.backend.oper;
+import dmd.backend.symbol;
+import dmd.backend.ty;
+import dmd.backend.type;
+
+import dmd.backend.debugprint : class_str, fl_str;
+
+import dmd.common.outbuffer;
+
+nothrow:
+@safe:
+
+private enum log = false;
+
+import dmd.backend.dwarf;
+import dmd.backend.mach;
+
+alias nlist = dmd.backend.mach.nlist;   // avoid conflict with dmd.backend.dlist.nlist
+
+struct MachObj
+{
+    OutBuffer* fobjbuf;
+    Symbol* GOTsym;
+    Symbol* chkstkSym;
+
+    OutBuffer* symtab_strings;    // String Table  - String table for all other names
+
+    union
+    {
+        Barray!section_64 section_64s; // array of struct section_64 for 64 bit targets
+        Barray!section    sections;    // array of struct section    for 32 bit targets
+    }
+    int section_length;           // number of sections in section_64s/sections array
+
+    bool AArch64;                 // true for AArch64, false for X86_64
+
+    /* Three symbol tables, because the different types of symbols
+     * are grouped into 3 different types (and a 4th for comdef's).
+     */
+    Barray!(Symbol*)  localSymbols;
+    Barray!(Symbol*) publicSymbols;
+    Barray!(Symbol*) externSymbols;
+
+    Barray!(Comdef) comdefs;
+
+    Barray!(Symbol*) indirectSymbols1; // indirect symbol table of Symbol*'s
+    int jumpTableSeg;                 // segment index for __jump_table
+
+    Barray!(Symbol*) indirectSymbols2; // indirect symbol table of Symbol*'s
+    int pointersSeg;                  // segment index for __pointers
+
+    /* If an MachObj_external_def() happens, set this to the string index,
+     * to be added last to the symbol table.
+     * Obviously, there can be only one.
+     */
+    IDXSTR extdef;
+
+    Symbol* tlv_bootstrap_sym;
+
+    /**
+     * Section index for the __thread_vars/__tls_data section.
+     *
+     * This section is used for the variable symbol for TLS variables.
+     */
+    int seg_tlsseg = UNKNOWN;
+
+    /**
+     * Section index for the __thread_bss section.
+     *
+     * This section is used for the data symbol ($tlv$init) for TLS variables
+     * without an initializer.
+     */
+    int seg_tlsseg_bss = UNKNOWN;
+
+    /**
+     * Section index for the __thread_data section.
+     *
+     * This section is used for the data symbol ($tlv$init) for TLS variables
+     * with an initializer.
+     */
+    int seg_tlsseg_data = UNKNOWN;
+
+    int seg_cstring = UNKNOWN;        // __cstring section
+    int seg_mod_init_func = UNKNOWN;  // __mod_init_func section
+    int seg_mod_term_func = UNKNOWN;  // __mod_term_func section
+    int seg_textcoal_nt = UNKNOWN;
+    int seg_tlscoal_nt = UNKNOWN;
+    int seg_datacoal_nt = UNKNOWN;
+}
+
+private __gshared MachObj machobj;
+
+
+enum DEST_LEN = (IDMAX + IDOHD + 1);
+
+struct Comdef { Symbol* sym; targ_size_t size; int count; }
+
+/******************************************
+ */
+
+/// Returns: a reference to the global offset table
+@trusted
+Symbol* MachObj_getGOTsym()
+{
+    if (!machobj.GOTsym)
+    {
+        machobj.GOTsym = symbol_name("_GLOBAL_OFFSET_TABLE_",SC.global,tspvoid);
+    }
+    return machobj.GOTsym;
+}
+
+void MachObj_refGOTsym()
+{
+    assert(0);
+}
+
+/// Returns: a reference to the ___chkstk_darwin pointer to function
+@trusted
+Symbol* MachObj_getChkstkSym()
+{
+    if (!machobj.chkstkSym)
+    {
+        machobj.chkstkSym = symbol_name("__chkstk_darwin",SC.global,tspvoid);
+    }
+    return machobj.chkstkSym;
+}
+
+
+
+// The object file is built is several separate pieces
+
+// The relocation for text and data seems to get lost.
+// Try matching the order gcc output them
+// This means defining the sections and then removing them if they are
+// not used.
+enum SEC_TAB_INIT = 16;          // Initial number of sections in buffer
+enum SEC_TAB_INC  = 4;           // Number of sections to increment buffer by
+
+enum SYM_TAB_INIT = 100;         // Initial number of symbol entries in buffer
+enum SYM_TAB_INC  = 50;          // Number of symbols to increment buffer by
+
+@trusted
+private void resetSymbols(OutBuffer* buf)
+{
+    Symbol** p = cast(Symbol**)buf.buf;
+    const size_t n = buf.length() / (Symbol*).sizeof;
+    for (size_t i = 0; i < n; ++i)
+        symbol_reset(*p[i]);
+}
+
+@trusted
+private void resetSymbols(Symbol*[] symbols)
+{
+    foreach (s; symbols)
+        symbol_reset(*s);
+}
+
+
+// Each compiler segment is a section
+// Predefined compiler segments CODE,DATA,CDATA,UDATA map to indexes
+//      into SegData[]
+//      New compiler segments are added to end.
+
+/******************************
+ * Returns !=0 if this segment is a code segment.
+ */
+@trusted
+int mach_seg_data_isCode(const ref seg_data sd)
+{
+    // The codegen assumes that code.data references are indirect,
+    // but when CDATA is treated as code reftoident will emit a direct
+    // relocation.
+    if (&sd == SegData[CDATA])
+        return false;
+
+    if (machobj.AArch64)
+    {
+        //printf("SDshtidx = %d, x%x\n", SDshtidx, machobj.section_64s[sd.SDshtidx].flags);
+        return machobj.section_64s[sd.SDshtidx].flags & (S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS);
+    }
+    else if (I64)
+    {
+        return strcmp(machobj.section_64s[sd.SDshtidx].segname.ptr, "__TEXT") == 0;
+    }
+    else
+    {
+        //printf("SDshtidx = %d, x%x\n", SDshtidx, machobj.sections[sd.SDshtidx].flags);
+        return strcmp(machobj.sections[sd.SDshtidx].segname.ptr, "__TEXT") == 0;
+    }
+}
+
+import dmd.backend.code: SegData;
+
+
+/*******************************
+ * Output a string into a string table
+ * Input:
+ *      strtab  =       string table for entry
+ *      str     =       string to add
+ *
+ * Returns index into the specified string table.
+ */
+@trusted
+IDXSTR MachObj_addstr(OutBuffer* strtab, const(char)* str)
+{
+    //printf("MachObj_addstr(strtab = %p str = '%s')\n",strtab,str);
+    IDXSTR idx = cast(IDXSTR)strtab.length();        // remember starting offset
+    strtab.writeStringz(str);
+    //printf("\tidx %d, new size %d\n",idx,strtab.length());
+    return idx;
+}
+
+/*******************************
+ * Output a mangled string into the symbol string table
+ * Input:
+ *      str     =       string to add
+ *
+ * Returns index into the table.
+ */
+@trusted
+private IDXSTR mach_addmangled(Symbol* s)
+{
+    //printf("mach_addmangled(%s)\n", s.Sident);
+    char[DEST_LEN] dest = void;
+    char* destr;
+    const(char)* name;
+    IDXSTR namidx;
+
+    namidx = cast(IDXSTR)machobj.symtab_strings.length();
+    destr = obj_mangle2(s, dest.ptr);
+    name = destr;
+    if (tyfunc(s.ty()) && s.Sfunc && s.Sfunc.Fredirect)
+        name = s.Sfunc.Fredirect;
+    machobj.symtab_strings.writeStringz(name);
+    if (destr != dest.ptr)                  // if we resized result
+        mem_free(destr);
+    //dbg_printf("\telf_addmagled symtab_strings %s namidx %d len %d size %d\n",name, namidx,len,machobj.symtab_strings.length());
+    return namidx;
+}
+
+/**************************
+ * Output read only data and generate a symbol for it.
+ *
+ */
+@trusted
+Symbol* MachObj_sym_cdata(tym_t ty,const(void)[] data)
+{
+    //printf("MachObj_sym_cdata(ty = %x, p = %x, len = %d, SegData[CDATA].SDoffset = %x)\n", ty, p, len, SegData[CDATA].SDoffset);
+    alignOffset(CDATA, tysize(ty));
+    Symbol* s = symboldata(SegData[CDATA].SDoffset, ty);
+    s.Sseg = CDATA;
+    //MachObj_pubdef(CDATA, s, SegData[CDATA].SDoffset);
+    MachObj_bytes(CDATA, SegData[CDATA].SDoffset, data);
+
+    s.Sfl = /*(config.flags3 & CFG3pic) ? FL.gotoff :*/ FL.extern_;
+    return s;
+}
+
+/**************************
+ * Output read only data for data
+ *
+ */
+@trusted
+int MachObj_data_readonly(void[] data, int* pseg)
+{
+    int oldoff = cast(int)SegData[CDATA].SDoffset;
+    SegData[CDATA].SDbuf.reserve(data.length);
+    SegData[CDATA].SDbuf.writen(data.ptr, data.length);
+    SegData[CDATA].SDoffset += data.length;
+    *pseg = CDATA;
+    return oldoff;
+}
+
+@trusted
+int MachObj_data_readonly(void[] data)
+{
+    int pseg;
+
+    return MachObj_data_readonly(data, &pseg);
+}
+
+/*****************************
+ * Get segment for readonly string literals.
+ * The linker will pool strings in this section.
+ * Params:
+ *    sz = number of bytes per character (1, 2, or 4)
+ * Returns:
+ *    segment index
+ */
+@trusted
+int MachObj_string_literal_segment(uint sz)
+{
+    if (sz == 1)
+        return getsegment2(machobj.seg_cstring, "__cstring", "__TEXT", 0, S_CSTRING_LITERALS);
+
+    return CDATA;  // no special handling for other wstring, dstring; use __const
+}
+
+/******************************
+ * Perform initialization that applies to all .o output files.
+ *      Called before any other obj_xxx routines
+ */
+@system
+Obj MachObj_init(OutBuffer* objbuf, const(char)* filename, const(char)* csegname)
+{
+    //printf("MachObj_init()\n");
+    Obj obj = cast(Obj)mem_calloc(__traits(classInstanceSize, Obj));
+
+    cseg = CODE;
+    machobj.AArch64 = config.target_cpu == TARGET_AArch64;
+    machobj.fobjbuf = objbuf;
+
+    machobj.seg_tlsseg = UNKNOWN;
+    machobj.seg_tlsseg_bss = UNKNOWN;
+    machobj.seg_tlsseg_data = UNKNOWN;
+    machobj.seg_cstring = UNKNOWN;
+    machobj.seg_mod_init_func = UNKNOWN;
+    machobj.seg_mod_term_func = UNKNOWN;
+    machobj.seg_textcoal_nt = UNKNOWN;
+    machobj.seg_tlscoal_nt = UNKNOWN;
+    machobj.seg_datacoal_nt = UNKNOWN;
+
+    // Initialize buffers
+
+    if (machobj.symtab_strings)
+        machobj.symtab_strings.setsize(1);
+    else
+    {
+        machobj.symtab_strings = cast(OutBuffer*) calloc(1, OutBuffer.sizeof);
+        if (!machobj.symtab_strings)
+            err_nomem();
+        machobj.symtab_strings.reserve(2048);
+        machobj.symtab_strings.writeByte(0);
+    }
+
+    machobj.localSymbols.setLength(SYM_TAB_INIT);       // reserve some space
+    machobj.localSymbols.reset();
+
+    resetSymbols(machobj.publicSymbols[]);
+    machobj.publicSymbols.setLength(SYM_TAB_INIT);       // reserve some space
+    machobj.publicSymbols.reset();
+
+    resetSymbols(machobj.externSymbols[]);
+    machobj.externSymbols.setLength(SYM_TAB_INIT);       // reserve some space
+    machobj.externSymbols.reset();
+
+    machobj.comdefs.setLength(SYM_TAB_INIT);       // reserve some space
+    machobj.comdefs.reset();
+
+    machobj.extdef = 0;
+
+    machobj.indirectSymbols1.reset();
+    machobj.jumpTableSeg = 0;
+
+    machobj.indirectSymbols2.reset();
+    machobj.pointersSeg = 0;
+
+    // Initialize segments for CODE, DATA, UDATA and CDATA
+    if (I64)
+    {
+        if (machobj.section_64s.length)
+            machobj.section_64s.setLength(1);
+        else
+        {
+            machobj.section_64s.setLength(SEC_TAB_INIT);
+            machobj.section_64s.setLength(0);
+            machobj.section_64s.push();    // first entry is 0
+        }
+    }
+    else
+    {
+        if (machobj.sections.length)
+            machobj.sections.setLength(1);
+        else
+        {
+            machobj.sections.setLength(SEC_TAB_INIT);
+            machobj.sections.setLength(0);
+            machobj.sections.push();      // first entry is 0
+        }
+    }
+
+    machobj.section_length = 0;
+
+    SegData.reset();   // recycle memory
+    SegData.push();    // element 0 is reserved
+
+    int p2align = I64 ? 4 : 2;            // align to 16 bytes for floating point
+    MachObj_getsegment("__text",  "__TEXT", 2, S_REGULAR | S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS);
+    MachObj_getsegment("__data",  "__DATA", p2align, S_REGULAR);    // DATA
+    MachObj_getsegment("__const", "__TEXT", 2, S_REGULAR);          // CDATA
+    MachObj_getsegment("__bss",   "__DATA", 4, S_ZEROFILL);         // UDATA
+    MachObj_getsegment("__const", "__DATA", p2align, S_REGULAR);    // CDATAREL
+
+    dwarf_initfile(filename);
+    return obj;
+}
+
+/**************************
+ * Initialize the start of object output for this particular .o file.
+ *
+ * Input:
+ *      filename:       Name of source file
+ *      csegname:       User specified default code segment name
+ */
+@trusted
+void MachObj_initfile(const(char)* filename, const(char)* csegname, const(char)* modname)
+{
+    //dbg_printf("MachObj_initfile(filename = %s, modname = %s)\n",filename,modname);
+    if (config.fulltypes)
+        dwarf_initmodule(filename, modname);
+}
+
+/************************************
+ * Patch pseg/offset by adding in the vmaddr difference from
+ * pseg/offset to start of seg.
+ */
+
+@trusted
+int32_t* patchAddr(int seg, targ_size_t offset)
+{
+    return cast(int32_t*)(machobj.fobjbuf.buf + machobj.sections[SegData[seg].SDshtidx].offset + offset);
+}
+
+@trusted
+int32_t* patchAddr64(int seg, targ_size_t offset)
+{
+    //printf("patchAddr64(seg = %d, offset = x%llx)\n", seg, offset);
+    return cast(int32_t*)(machobj.fobjbuf.buf + machobj.section_64s[SegData[seg].SDshtidx].offset + offset);
+}
+
+@trusted
+void patch(seg_data* pseg, targ_size_t offset, int seg, targ_size_t value)
+{
+    //printf("patch(offset = x%04x, seg = %d, value = x%llx)\n", cast(uint)offset, seg, value);
+    if (I64)
+    {
+        int32_t* p = cast(int32_t*)(machobj.fobjbuf.buf + machobj.section_64s[pseg.SDshtidx].offset + offset);
+        if (log)
+            debug printf("\taddr1 = x%llx\n\taddr2 = x%llx\n\t*p = x%x\n\tdelta = x%llx\n",
+                         machobj.section_64s[pseg.SDshtidx].addr,
+                         machobj.section_64s[SegData[seg].SDshtidx].addr,
+                         *p,
+                         machobj.section_64s[SegData[seg].SDshtidx].addr -
+                         (machobj.section_64s[pseg.SDshtidx].addr + offset));
+        *p += machobj.section_64s[SegData[seg].SDshtidx].addr -
+              (machobj.section_64s[pseg.SDshtidx].addr - value);
+    }
+    else
+    {
+        int32_t* p = cast(int32_t*)(machobj.fobjbuf.buf + machobj.sections[pseg.SDshtidx].offset + offset);
+        if (log)
+            debug printf("\taddr1 = x%x\n\taddr2 = x%x\n\t*p = x%x\n\tdelta = x%llx\n",
+                         machobj.sections[pseg.SDshtidx].addr,
+                         machobj.sections[SegData[seg].SDshtidx].addr,
+                         *p,
+                         machobj.sections[SegData[seg].SDshtidx].addr -
+                         (machobj.sections[pseg.SDshtidx].addr + offset));
+        *p += machobj.sections[SegData[seg].SDshtidx].addr -
+              (machobj.sections[pseg.SDshtidx].addr - value);
+    }
+}
+
+/***************************
+ * Number symbols so they are
+ * ordered as locals, public and then extern/comdef
+ * Return:
+ *      nsyms (number of symbols)
+ */
+@trusted
+int mach_numbersyms()
+{
+    // Sort Symbols for faster searching
+    sortSymbols(machobj.localSymbols[]);
+    sortSymbols(machobj.publicSymbols[]);
+    //sortSymbols(machobj.externSymbols[]); // no need to sort these
+    //sortComdefs(machobj.comdefs[]);       // not implemented yet
+
+    /* Print symbol table contents
+     */
+    static if (0)
+    {
+        printf("localSymbols\n");
+        foreach (i, s; machobj.localSymbols[])
+            printf("[%zd] %p SC.%s %s\n", i, s, class_str(s.Sclass), s.Sident.ptr);
+        printf("publicSymbols\n");
+        foreach (i, s; machobj.publicSymbols[])
+            printf("[%zd] %p SC.%s %s\n", i, s, class_str(s.Sclass), s.Sident.ptr);
+        printf("externSymbols\n");
+        foreach (i, s; machobj.externSymbols[])
+            printf("[%zd] %p SC.%s %s\n", i, s, class_str(s.Sclass), s.Sident.ptr);
+        printf("comdefs\n");
+        foreach (i, c; machobj.comdefs[])
+            printf("[%zd] %p SC.%s %s\n", i, c.sym, class_str(c.sym.Sclass), c.sym.Sident.ptr);
+        printf("\n");
+    }
+
+    //printf("mach_numbersyms()\n");
+    int n = 0;
+
+    foreach (s; machobj.localSymbols[])
+    {
+        //printf("assigning %2d to %s\n", n, s.Sident.ptr);
+        s.Sxtrnnum = n;
+        n++;
+    }
+
+    foreach (s; machobj.publicSymbols[])
+    {
+        assert(s.Sclass != SC.extern_);
+        //printf("assigning %2d to %s\n", n, s.Sident.ptr);
+        s.Sxtrnnum = n;
+        n++;
+    }
+
+    /* Search externSymbols[] for duplicates of symbols in publicSymbols([].
+     * Forward extern symbol to the public symbol, and delete the extern symbol
+     * from the mach symbol table.
+     * Not sure localSymbols or comdefs can contain duplicates.
+     */
+    if (machobj.AArch64)
+    for (int i = 0; i < machobj.externSymbols.length; )
+    {
+        Symbol* s = machobj.externSymbols[i];
+        Symbol* sfwd = searchSymbols(machobj.publicSymbols[], s.Sident.ptr);
+        if (sfwd)
+        {
+            assert(sfwd.Sclass != SC.extern_);
+            s.Sforward = sfwd;
+            machobj.externSymbols.remove(i);    // remove s
+            //printf("extern %p %s forwarded to %p %s %d\n", s, s.Sident.ptr, sfwd, sfwd.Sident.ptr, sfwd.Sxtrnnum);
+            continue;
+        }
+        ++i;
+    }
+
+    foreach (s; machobj.externSymbols[])
+    {
+        //printf("assigning %2d to %s\n", n, s.Sident.ptr);
+        s.Sxtrnnum = n;
+        n++;
+    }
+
+    foreach (ref c; machobj.comdefs[])
+    {
+        //printf("assigning %2d to %s\n", n, c.sym.Sident.ptr);
+        c.sym.Sxtrnnum = n;
+        n++;
+    }
+
+    //printf("n: %d\n", n);
+    return n;
+}
+
+
+/***************************
+ * Fixup and terminate object file.
+ */
+@trusted
+void MachObj_termfile()
+{
+    //dbg_printf("MachObj_termfile\n");
+    if (config.addlinenumbers)
+    {
+        dwarf_termmodule();
+    }
+}
+
+static if (0)
+void segsizes() @trusted
+{
+    printf("Segsizes\n");
+    for (int seg = 1; seg < SegData.length; seg++)
+    {
+        seg_data* pseg = SegData[seg];
+        if (pseg.SDbuf && pseg.SDbuf.length())
+            printf("\tpseg: %p SDbuf: %p %d SDbuf.length %zx\n", pseg, pseg.SDbuf, seg, pseg.SDbuf.length());
+    }
+}
+
+/*********************************
+ * Terminate package.
+ */
+@trusted
+void MachObj_term(const(char)[] objfilename)
+{
+    //printf("MachObj_term() ======================================== \n");
+
+    auto machobj = &machobj; // make global a local for faster access
+
+    outfixlist();           // backpatches
+
+    if (config.addlinenumbers)
+    {
+        dwarf_termfile();
+    }
+
+    /* Write out the object file in the following order:
+     *  header
+     *  commands
+     *          segment_command
+     *                  { sections }
+     *          symtab_command
+     *          dysymtab_command
+     *          build_version_command/version_min_command
+     *  { segment contents }
+     *  { relocations }
+     *  symbol table
+     *  string table
+     *  indirect symbol table
+     */
+
+    auto version_command = VersionCommand(operatingSystemVersion);
+    uint foffset;
+    uint headersize;
+    uint sizeofcmds;
+
+    // Write out the bytes for the header
+    if (I64)
+    {
+        mach_header_64 header;
+
+        header.magic = MH_MAGIC_64;
+        header.cputype    = machobj.AArch64 ? CPU_TYPE_ARM64        : CPU_TYPE_X86_64;
+        header.cpusubtype = machobj.AArch64 ? CPU_SUBTYPE_ARM64_ALL : CPU_SUBTYPE_I386_ALL;
+        header.filetype = MH_OBJECT;
+        header.ncmds = 4;
+        header.sizeofcmds = cast(uint)(segment_command_64.sizeof +
+                                machobj.section_length * section_64.sizeof +
+                            version_command.size +
+                            symtab_command.sizeof +
+                            dysymtab_command.sizeof);
+        header.flags = MH_SUBSECTIONS_VIA_SYMBOLS;
+        header.reserved = 0;
+        machobj.fobjbuf.write(&header, header.sizeof);
+        foffset = header.sizeof;       // start after header
+        headersize = header.sizeof;
+        sizeofcmds = header.sizeofcmds;
+
+        // Write the actual data later
+        machobj.fobjbuf.writezeros(header.sizeofcmds);
+        foffset += header.sizeofcmds;
+    }
+    else
+    {
+        mach_header header;
+
+        header.magic = MH_MAGIC;
+        header.cputype = CPU_TYPE_I386;
+        header.cpusubtype = CPU_SUBTYPE_I386_ALL;
+        header.filetype = MH_OBJECT;
+        header.ncmds = 4;
+        header.sizeofcmds = cast(uint)(segment_command.sizeof +
+                                machobj.section_length * section.sizeof +
+                            version_command.size +
+                            symtab_command.sizeof +
+                            dysymtab_command.sizeof);
+        header.flags = MH_SUBSECTIONS_VIA_SYMBOLS;
+        machobj.fobjbuf.write(&header, header.sizeof);
+        foffset = header.sizeof;       // start after header
+        headersize = header.sizeof;
+        sizeofcmds = header.sizeofcmds;
+
+        // Write the actual data later
+        machobj.fobjbuf.writezeros(header.sizeofcmds);
+        foffset += header.sizeofcmds;
+    }
+
+    segment_command segment_cmd = segment_command.init;
+    segment_command_64 segment_cmd64 = segment_command_64.init;
+    symtab_command symtab_cmd = symtab_command.init;
+    dysymtab_command dysymtab_cmd = dysymtab_command.init;
+
+    if (I64)
+    {
+        segment_cmd64.cmd = LC_SEGMENT_64;
+        segment_cmd64.cmdsize = cast(uint)(segment_cmd64.sizeof +
+                                    machobj.section_length * section_64.sizeof);
+        segment_cmd64.nsects = machobj.section_length;
+        segment_cmd64.maxprot = 7;
+        segment_cmd64.initprot = 7;
+    }
+    else
+    {
+        segment_cmd.cmd = LC_SEGMENT;
+        segment_cmd.cmdsize = cast(uint)(segment_cmd.sizeof +
+                                    machobj.section_length * section.sizeof);
+        segment_cmd.nsects = machobj.section_length;
+        segment_cmd.maxprot = 7;
+        segment_cmd.initprot = 7;
+    }
+
+    symtab_cmd.cmd = LC_SYMTAB;
+    symtab_cmd.cmdsize = symtab_cmd.sizeof;
+
+    dysymtab_cmd.cmd = LC_DYSYMTAB;
+    dysymtab_cmd.cmdsize = dysymtab_cmd.sizeof;
+
+    /* If a __pointers section was emitted, need to set the .reserved1
+     * field to the symbol index in the indirect symbol table of the
+     * start of the __pointers symbols.
+     */
+    if (machobj.pointersSeg)
+    {
+        seg_data* pseg = SegData[machobj.pointersSeg];
+        if (I64)
+        {
+            section_64* psechdr = &machobj.section_64s[pseg.SDshtidx]; // corresponding section
+            psechdr.reserved1 = cast(uint)machobj.indirectSymbols1.length;
+        }
+        else
+        {
+            section* psechdr = &machobj.sections[pseg.SDshtidx]; // corresponding section
+            psechdr.reserved1 = cast(uint)machobj.indirectSymbols1.length;
+        }
+    }
+
+    // Walk through sections determining size and file offsets
+
+    //
+    // First output individual section data associate with program
+    //  code and data
+    //
+    foffset = elf_align(I64 ? 8 : 4, foffset);
+    if (I64)
+        segment_cmd64.fileoff = foffset;
+    else
+        segment_cmd.fileoff = foffset;
+    uint vmaddr = 0;
+
+    /* AArch64 requires that zero-filled segments go to the end, so prepare
+     * a mapping to convert Sseg numbers to seg numbers in the object file
+     */
+    int[] table  = (cast(int*)mem_malloc(SegData.length * int.sizeof))[0 .. SegData.length];
+    int[] order  = (cast(int*)mem_calloc(SegData.length * int.sizeof))[0 .. SegData.length];
+    {
+        table[0] = 0;
+        order[0] = 0;
+        size_t numZeroFill = table.length;
+        foreach (seg, pseg; SegData[1 .. $])
+        {
+            int zeroFill;
+            if (I64)
+            {
+                section_64* psechdr = &machobj.section_64s[pseg.SDshtidx]; // corresponding section
+
+                zeroFill = (psechdr.flags == S_ZEROFILL || psechdr.flags == S_THREAD_LOCAL_ZEROFILL);
+            }
+            else
+            {
+                section* psechdr = &machobj.sections[pseg.SDshtidx]; // corresponding section
+
+                zeroFill = (psechdr.flags == S_ZEROFILL || psechdr.flags == S_THREAD_LOCAL_ZEROFILL);
+            }
+            table[seg + 1] = zeroFill;
+            numZeroFill -= zeroFill;
+        }
+
+        //printf("numZeroFill: %zd\n", numZeroFill);
+        int j = 0;
+        foreach (i; 0 .. table.length)
+        {
+            if (table[i])
+                continue;
+            order[j++] = cast(int)i;
+        }
+
+        foreach (i; 0 .. table.length)
+        {
+            if (!table[i])
+                continue;
+            order[j++] = cast(int)i;
+        }
+        assert(j == order.length);
+
+        int k = 0;
+        foreach (i; 0 .. table.length)
+        {
+            if (table[i])
+            {
+                table[i] = cast(int)numZeroFill;
+                ++numZeroFill;
+            }
+            else
+                table[i] = k++;
+        }
+    }
+
+    if (!machobj.AArch64)       // x86_64 can put the bss segment anywhere rather than at the end
+        foreach (i; 1 .. table.length)
+        {
+            table[i] = cast(int)i;
+            order[i] = cast(int)i;
+        }
+
+    static if (0)
+        foreach (i; 1 .. table.length)
+            printf("table[%d]: %d order: %d SDshtidx: %d\n", cast(int)i, table[i], order[i], SegData[i].SDshtidx);
+
+    //printf("\nSetup offsets and sizes foffset %d\n\tSegData.length %zx\n",foffset,SegData.length);
+    {
+        /* For each segment, write the segment data bytes out to fobjbuf */
+        for (int seg = 1; seg < SegData.length; seg++)
+        {
+            seg_data* pseg = SegData[order[seg]];
+            if (I64)
+            {
+                //printf("writing seg %d order: %d SDshtidx: %d\n", seg, order[seg], pseg.SDshtidx);
+                section_64* psechdr = &machobj.section_64s[pseg.SDshtidx]; // corresponding section
+
+                int align_ = 1 << psechdr._align;
+                while (psechdr._align > 0 && align_ < pseg.SDalignment)
+                {
+                    psechdr._align += 1;
+                    align_ <<= 1;
+                }
+                foffset = elf_align(align_, foffset);
+                vmaddr = (vmaddr + align_ - 1) & ~(align_ - 1);
+                if (psechdr.flags == S_ZEROFILL || psechdr.flags == S_THREAD_LOCAL_ZEROFILL)
+                {
+                    psechdr.offset = 0;
+                    psechdr.size = pseg.SDoffset; // accumulated size
+                    //printf("\tzero section name %s size x%zx\n", psechdr.sectname.ptr, pseg.SDoffset);
+                }
+                else
+                {
+                    psechdr.offset = foffset;
+                    psechdr.size = 0;
+                    //printf("\t%d section name %s,", order[seg], psechdr.sectname.ptr);
+                    if (pseg.SDbuf && pseg.SDbuf.length())
+                    {
+                        //printf("\tSDbuf.length %zx\n", pseg.SDbuf.length());
+                        psechdr.size = pseg.SDbuf.length();
+                        machobj.fobjbuf.write(pseg.SDbuf.buf, cast(uint)psechdr.size);
+                        foffset += psechdr.size;
+                    }
+                    //else
+                        //printf("\n");
+                }
+                psechdr.addr = vmaddr;
+                vmaddr += psechdr.size;
+                //printf(" assigned offset %d, size %d\n", foffset, psechdr.sh_size);
+            }
+            else
+            {
+                section* psechdr = &machobj.sections[pseg.SDshtidx]; // corresponding section
+
+                int align_ = 1 << psechdr._align;
+                while (psechdr._align > 0 && align_ < pseg.SDalignment)
+                {
+                    psechdr._align += 1;
+                    align_ <<= 1;
+                }
+                foffset = elf_align(align_, foffset);
+                vmaddr = (vmaddr + align_ - 1) & ~(align_ - 1);
+                if (psechdr.flags == S_ZEROFILL || psechdr.flags == S_THREAD_LOCAL_ZEROFILL)
+                {
+                    psechdr.offset = 0;
+                    psechdr.size = cast(uint)pseg.SDoffset; // accumulated size
+                }
+                else
+                {
+                    psechdr.offset = foffset;
+                    psechdr.size = 0;
+                    //printf("\tsection name %s,", psechdr.sectname);
+                    if (pseg.SDbuf && pseg.SDbuf.length())
+                    {
+                        //printf("\tsize %d\n", pseg.SDbuf.length());
+                        psechdr.size = cast(uint)pseg.SDbuf.length();
+                        machobj.fobjbuf.write(pseg.SDbuf.buf, psechdr.size);
+                        foffset += psechdr.size;
+                    }
+                }
+                psechdr.addr = vmaddr;
+                vmaddr += psechdr.size;
+                //printf(" assigned offset %d, size %d\n", foffset, psechdr.sh_size);
+            }
+        }
+    }
+
+    if (I64)
+    {
+        segment_cmd64.vmsize = vmaddr;
+        segment_cmd64.filesize = foffset - segment_cmd64.fileoff;
+        /* Bugzilla 5331: Apparently having the filesize field greater than the vmsize field is an
+         * error, and is happening sometimes.
+         */
+        if (segment_cmd64.filesize > vmaddr)
+            segment_cmd64.vmsize = segment_cmd64.filesize;
+    }
+    else
+    {
+        segment_cmd.vmsize = vmaddr;
+        segment_cmd.filesize = foffset - segment_cmd.fileoff;
+        /* Bugzilla 5331: Apparently having the filesize field greater than the vmsize field is an
+         * error, and is happening sometimes.
+         */
+        if (segment_cmd.filesize > vmaddr)
+            segment_cmd.vmsize = segment_cmd.filesize;
+    }
+
+    // Put out relocation data
+    // See mach-o/reloc.h for some examples of what should be generated and when:
+    // https://github.com/apple-oss-distributions/xnu/blob/rel/xnu-10002/EXTERNAL_HEADERS/mach-o/x86_64/reloc.h
+    int nsyms = mach_numbersyms();
+    for (int seg = 1; seg < SegData.length; seg++)
+    {
+        static if (0)
+        if (seg == 1)
+        {
+            void* p = patchAddr64(seg, 0);
+            size_t nbytes = machobj.section_64s[SegData[seg].SDshtidx].size;   // corresponding section
+            dumpBytes(0, nbytes, p);
+        }
+
+        seg_data* pseg = SegData[seg];
+        section* psechdr = null;
+        section_64* psechdr64 = null;
+        if (I64)
+        {
+            psechdr64 = &machobj.section_64s[pseg.SDshtidx];   // corresponding section
+            //printf("psechdr.addr = x%llx\n", psechdr64.addr);
+        }
+        else
+        {
+            psechdr = &machobj.sections[pseg.SDshtidx];   // corresponding section
+            //printf("psechdr.addr = x%x\n", psechdr.addr);
+        }
+        foffset = elf_align(I64 ? 8 : 4, foffset);
+        uint reloff = foffset;
+        uint nreloc = 0;
+
+        {
+            foreach (ref r; pseg.relocations[])
+            {
+                Symbol* s = r.targsym;
+                if (s && s.Sforward /*&& !s.Sxtrnnum*/)
+                {
+                    static if (0)
+                    if (s.Sforward.Sxtrnnum == 0)
+                    {
+                        printf("symbol %p '%s'\n ", s, s.Sident.ptr);
+                            printf(" Sclass = SC.%s ", class_str(s.Sclass));
+                            printf(" Ssymnum = %d",cast(int)s.Ssymnum);
+                            printf(" Sxtrnnum = %d",cast(int)s.Sxtrnnum);
+                            printf(" Sfl = %s\n", fl_str(cast(FL) s.Sfl));
+                        printf("forward %p '%s'\n ", s.Sforward, s.Sforward.Sident.ptr);
+                            printf(" Sclass = SC.%s ", class_str(s.Sforward.Sclass));
+                            printf(" Sxtrnnum = %d",cast(int)s.Sforward.Sxtrnnum);
+                            printf(" Sfl = %s\n\n", fl_str(cast(FL) s.Sforward.Sfl));
+                    }
+                    s = s.Sforward;
+                }
+
+                const(char)* rs = r.rtype == REL.address ? "address" :  // 32 bit address
+                                  r.rtype == REL.add     ? "add"  :
+                                  r.rtype == REL.rel26   ? "rel26"  :
+                                                           "rel";
+                //if (s) printf("seg: %d targsym %s funcsym %s\n", seg, s ? s.Sident.ptr : "null", r.funcsym ? r.funcsym.Sident.ptr : "null");
+                relocation_info rel;
+                scattered_relocation_info srel;
+                if (machobj.AArch64)
+                {
+                    if (s) // target symbol
+                    {
+                        //printf("s.Sident: %s\n", s.Sident.ptr);
+                        //{ printf("seg: %d offset: %llx, contents: %x\n", seg, r.offset, value); }
+                        int* pvalue = patchAddr64(seg, r.offset);       // pointer to 32 bit value at the fixup location
+                        int value = *pvalue;
+                        bool isPersonality = strcmp(s.Sident.ptr,  "_D6object9Throwable7__ClassZ") == 0;
+                        if (0 && isPersonality)
+                        {   symbol_print(*s);
+                            printf("%d:x%04llx isCode %x : targseg %d targsym %s REL%s subtractor %d\n", seg, r.offset, pseg.isCode(), r.targseg, s ? s.Sident.ptr : "0", rs, r.subtractor);
+                        }
+                        if (r.subtractor)  // emit SUBTRACTOR/UNSIGNED pair
+                        {
+                            if (0)//s.Sclass == SC.locstat)
+                            {
+                                printf("----------------------------------------\n");
+                                symbol_print(*s);
+                                if (s) printf("seg: %d targsym: %s funcsym: %s\n", seg, s ? s.Sident.ptr : "null", r.funcsym ? r.funcsym.Sident.ptr : "null");
+                                printf("%d:x%04llx isCode %x : targseg %d targsym %s REL%s subtractor %d\n", seg, r.offset, pseg.isCode(), r.targseg, s ? s.Sident.ptr : "0", rs, r.subtractor);
+                            }
+                            //printf("rel1\n");
+                            rel.r_type = ARM64_RELOC_SUBTRACTOR;
+                            rel.r_address = cast(int)r.offset;
+                            rel.r_pcrel = 0;
+                            rel.r_length = 3;
+                            rel.r_extern = s.Sclass == SC.locstat ? 0 : 1;
+                            if (rel.r_extern == 1)
+                            {
+                                rel.r_symbolnum = s.Sxtrnnum;
+                                assert(rel.r_symbolnum < nsyms);
+                            }
+                            else
+                            {
+                                rel.r_symbolnum = table[s.Sseg];
+                                assert(rel.r_symbolnum < SegData.length);
+                            }
+                            machobj.fobjbuf.write(&rel, rel.sizeof);
+                            foffset += (rel).sizeof;
+                            ++nreloc;
+
+                            rel.r_type = ARM64_RELOC_UNSIGNED;
+                            machobj.fobjbuf.write(&rel, rel.sizeof);
+                            foffset += rel.sizeof;
+                            ++nreloc;
+
+                            // patch with fdesym.Soffset - offset
+                            *pvalue += r.funcsym.Soffset - r.offset;
+                            continue;
+                        }
+                        else if (pseg.isCode())
+                        {
+                            //printf("rel2 %s\n", rs);
+                            //printf("AArch64\n");
+                            //symbol_print(*s);
+                            switch (s.Sclass)
+                            {
+                                case SC.extern_:
+                                case SC.comdat:
+                                case SC.comdef:
+                                case SC.static_:
+                                    if (/*s.Sfl == FL.func &&*/ r.rtype == REL.rel26)
+                                    {
+                                        //printf("BRANCHY26 %08x %s\n", value, s.Sident.ptr);
+                                        rel.r_type = ARM64_RELOC_BRANCHY26;
+                                        rel.r_pcrel = 1;
+                                    }
+                                    else if (s.Sfl == FL.unde ||   // special case for __chkstk_darwin, need to research what PAGEOFF12 really means
+                                             s.Sfl == FL.extern_ ||
+                                             (s.Sclass == SC.extern_ && s.Sfl == FL.func) ||
+                                             (s.Sclass == SC.global  && s.Sfl == FL.func) ||
+                                             (s.Sclass == SC.comdat  && s.Sfl == FL.func) ||
+                                             //(s.Sclass == SC.static_ && s.Sfl == FL.data) ||
+                                             s.Sfl == FL.tlsdata)
+                                    {
+                                        rel.r_type = r.rtype == REL.add ? ARM64_RELOC_GOT_LOAD_PAGEOFF12 : ARM64_RELOC_GOT_LOAD_PAGE21;
+                                        if (s.Sfl == FL.tlsdata ||
+                                            (s.Sfl == FL.data || s.Sfl == FL.extern_) && (s.ty() & mTYLINK) == mTYthread)
+                                            rel.r_type = r.rtype == REL.add ? ARM64_RELOC_TLVP_LOAD_PAGEOFF12 : ARM64_RELOC_TLVP_LOAD_PAGE21;
+                                        rel.r_pcrel = r.rtype == REL.add ? 0 : 1;
+                                    }
+                                    else
+                                    {
+                                        // BUG AArch64: failing test20050.d, should pick RELOC_PAGEOFF12 ??!!
+                                        //rel.r_type = r.rtype == REL.add ? ARM64_RELOC_GOT_LOAD_PAGEOFF12 : ARM64_RELOC_GOT_LOAD_PAGE21;
+                                        rel.r_type = r.rtype == REL.add ? ARM64_RELOC_PAGEOFF12 : ARM64_RELOC_PAGE21;
+                                        rel.r_pcrel = r.rtype == REL.add ? 0 : 1;
+                                    }
+                                    if (s.Sfl == FL.tlsdata && s.Sclass == SC.comdat)
+                                        goto case SC.global;
+                                    rel.r_address = cast(int)r.offset;
+                                    rel.r_symbolnum = s.Sxtrnnum;
+                                    assert(s.Sxtrnnum < nsyms);
+                                    rel.r_length = 2;
+                                    rel.r_extern = 1;
+                                    machobj.fobjbuf.write(&rel, rel.sizeof);
+                                    foffset += rel.sizeof;
+                                    nreloc++;
+                                    break;
+
+                                case SC.global:
+                                    if (/*s.Sfl == FL.func &&*/ r.rtype == REL.rel26)
+                                        goto case SC.extern_;
+                                    if (s.Sfl == FL.func)
+                                        goto case SC.extern_;
+                                    rel.r_type = r.rtype == REL.add ? ARM64_RELOC_PAGEOFF12 : ARM64_RELOC_PAGE21;
+                                    //rel.r_type = r.rtype == REL.add ? ARM64_RELOC_GOT_LOAD_PAGEOFF12 : ARM64_RELOC_GOT_LOAD_PAGE21;
+                                    //rel.r_type = r.rtype == REL.add ? ARM64_RELOC_PAGEOFF12 : ARM64_RELOC_PAGE21;
+                                    if (s.Sfl == FL.tlsdata || s.Sfl == FL.data && (s.ty() & mTYLINK) == mTYthread)
+                                        rel.r_type = r.rtype == REL.add ? ARM64_RELOC_TLVP_LOAD_PAGEOFF12 : ARM64_RELOC_TLVP_LOAD_PAGE21;
+
+                                    rel.r_pcrel = r.rtype == REL.add ? 0 : 1;
+                                    rel.r_address = cast(int)r.offset;
+                                    rel.r_symbolnum = s.Sxtrnnum;
+                                    assert(s.Sxtrnnum < nsyms);
+                                    rel.r_length = 2;
+                                    rel.r_extern = 1;
+                                    machobj.fobjbuf.write(&rel, rel.sizeof);
+                                    foffset += rel.sizeof;
+                                    nreloc++;
+                                    break;
+
+                                case SC.locstat:
+                                    if (/*s.Sfl == FL.func &&*/ r.rtype == REL.rel26)
+                                        goto case SC.extern_;
+                                    assert(s.Sfl != FL.tlsdata);
+                                    rel.r_type = r.rtype == REL.add ? ARM64_RELOC_PAGEOFF12 : ARM64_RELOC_PAGE21;
+                                    rel.r_pcrel = r.rtype == REL.add ? 0 : 1;
+                                    rel.r_address = cast(int)r.offset;
+                                    rel.r_symbolnum = s.Sxtrnnum;
+                                    assert(s.Sxtrnnum < nsyms);
+                                    rel.r_length = 2;
+                                    rel.r_extern = 1; // 0?
+                                    machobj.fobjbuf.write(&rel, rel.sizeof);
+                                    foffset += rel.sizeof;
+                                    nreloc++;
+                                    break;
+
+                                default:
+                                    symbol_print(*s);
+                                    assert(0);
+                            }
+                            //dumpFixup(*s, rel.r_type);
+                            //assert(rel.r_address < section.size);
+
+                            /* Ensure relocation matches instruction */
+                            //import dmd.backend.x86.cgcod : disassemble;
+                            //printf("value: x%08x\n", value); disassemble(value);
+                            switch (rel.r_type)
+                            {
+                                case ARM64_RELOC_PAGEOFF12:
+                                case ARM64_RELOC_GOT_LOAD_PAGEOFF12:
+                                case ARM64_RELOC_TLVP_LOAD_PAGEOFF12: assert(1 || INSTR.isPAGEOFF12(value)); break;
+                                case ARM64_RELOC_PAGE21:
+                                case ARM64_RELOC_GOT_LOAD_PAGE21:
+                                case ARM64_RELOC_TLVP_LOAD_PAGE21:    assert(1 || INSTR.isPAGE21   (value)); break;
+static if (0)
+{
+                                case ARM64_RELOC_TLVP_LOAD_PAGE21:
+                                    if (!INSTR.isPAGE21(value))
+                                    {   dumpFixup(*s, rel.r_type); printf("rs: REL.%s value: x%08x\n", rs, value); disassemble(value); assert(0); }
+                                    break;
+}
+                               case ARM64_RELOC_BRANCHY26:           assert(1 || INSTR.isBRANCHY26(value)); break;
+                                default:
+                                    break;
+                            }
+                            continue;
+                        }
+                        else
+                        {
+                            //printf("rel3*************************\n");
+                            if (s.Sclass == SC.locstat && s.Sfl == FL.tlsdata)
+                            {
+                                rel.r_address = cast(int)r.offset;
+                                rel.r_symbolnum = s.Sxtrnnum;
+                                assert(s.Sxtrnnum < nsyms);
+                                rel.r_pcrel = 0;
+                                rel.r_length = 3;
+                                rel.r_extern = 1;
+                                rel.r_type = ARM64_RELOC_UNSIGNED;
+                                machobj.fobjbuf.write(&rel, rel.sizeof);
+                                foffset += rel.sizeof;
+                                nreloc++;
+                                //int32_t* p = patchAddr64(seg, r.offset);
+                                // Absolute address; add in addr of start of targ seg
+                                //  *p += machobj.section_64s[SegData[s.Sseg].SDshtidx].addr + s.Soffset;
+                                //patch(pseg, r.offset, s.Sseg, s.Soffset);
+                            }
+                            else if (s.Sclass == SC.extern_ ||
+                                s.Sclass == SC.comdef ||
+                                s.Sclass == SC.comdat)
+                            {
+                                rel.r_address = cast(int)r.offset;
+                                rel.r_symbolnum = s.Sxtrnnum;
+                                assert(s.Sxtrnnum < nsyms);
+                                if (r.rtype == REL.rel)
+                                {
+                                    rel.r_pcrel = 1;
+                                    rel.r_length = 2;
+                                    rel.r_type = ARM64_RELOC_POINTER_TO_GOT;
+                                }
+                                else
+                                {
+                                    rel.r_pcrel = 0;
+                                    rel.r_length = 3;
+                                    rel.r_type = ARM64_RELOC_UNSIGNED;
+                                }
+                                rel.r_extern = 1;
+                                machobj.fobjbuf.write(&rel, rel.sizeof);
+                                foffset += rel.sizeof;
+                                nreloc++;
+                                continue;
+                            }
+                            else
+                            {
+                                rel.r_address = cast(int)r.offset;
+                                rel.r_symbolnum = table[s.Sseg];
+                                assert(rel.r_symbolnum < SegData.length);
+                                if (r.rtype == REL.rel)
+                                {
+                                    rel.r_pcrel = 1;
+                                    rel.r_length = 2;
+                                }
+                                else
+                                {
+                                    rel.r_pcrel = 0;
+                                    rel.r_length = 3;
+                                }
+                                rel.r_extern = 0;
+                                assert(rel.r_symbolnum < SegData.length);
+                                rel.r_type = ARM64_RELOC_UNSIGNED;
+                                machobj.fobjbuf.write(&rel, rel.sizeof);
+                                foffset += rel.sizeof;
+                                nreloc++;
+
+                                //printf("rs: %s s.Soffset: x%zx\n", rs, s.Soffset);
+                                if (r.rtype == REL.address)
+                                {
+                                    int32_t* p = patchAddr64(seg, r.offset);
+                                    // Absolute address; add in addr of start of targ seg
+                                    *p += machobj.section_64s[SegData[s.Sseg].SDshtidx].addr + s.Soffset;
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                    else if (r.rtype == REL.address && pseg.isCode())
+                    {
+                        assert(!machobj.AArch64);
+                        srel.r_scattered = 1;
+
+                        srel.r_address = cast(uint)r.offset;
+                        srel.r_length = 2;
+                        if (I64)
+                        {
+                            int32_t* p64 = patchAddr64(seg, r.offset);
+                            srel.r_type = X86_64_RELOC_GOT;
+                            srel.r_value = cast(int)(machobj.section_64s[SegData[r.targseg].SDshtidx].addr + *p64);
+                            //printf("SECTDIFF: x%llx + x%llx = x%x\n", machobj.sections[SegData[r.targseg].SDshtidx].addr, *p, srel.r_value);
+                        }
+                        else
+                        {
+                            int32_t* p = patchAddr(seg, r.offset);
+                            srel.r_type = GENERIC_RELOC_LOCAL_SECTDIFF;
+                            srel.r_value = machobj.sections[SegData[r.targseg].SDshtidx].addr + *p;
+                            //printf("SECTDIFF: x%x + x%x = x%x\n", machobj.sections[SegData[r.targseg].SDshtidx].addr, *p, srel.r_value);
+                        }
+                        srel.r_pcrel = 0;
+                        machobj.fobjbuf.write(&srel, srel.sizeof);
+                        foffset += srel.sizeof;
+                        nreloc++;
+
+                        srel.r_address = 0;
+                        srel.r_length = 2;
+                        if (I64)
+                        {
+                            srel.r_type = X86_64_RELOC_SIGNED;
+                            srel.r_value = cast(int)(machobj.section_64s[pseg.SDshtidx].addr +
+                                    r.funcsym.Slocalgotoffset + _tysize[TYnptr]);
+                        }
+                        else
+                        {
+                            srel.r_type = GENERIC_RELOC_PAIR;
+                            if (r.funcsym)
+                                srel.r_value = cast(int)(machobj.sections[pseg.SDshtidx].addr +
+                                        r.funcsym.Slocalgotoffset + _tysize[TYnptr]);
+                            else
+                                srel.r_value = cast(int)(psechdr.addr + r.offset);
+                            //printf("srel.r_value = x%x, psechdr.addr = x%x, r.offset = x%x\n",
+                                //cast(int)srel.r_value, cast(int)psechdr.addr, cast(int)r.offset);
+                        }
+                        srel.r_pcrel = 0;
+                        machobj.fobjbuf.write(&srel, srel.sizeof);
+                        foffset += srel.sizeof;
+                        nreloc++;
+
+                        // Recalc due to possible realloc of machobj.fobjbuf.buf
+                        if (I64)
+                        {
+                            int32_t* p64 = patchAddr64(seg, r.offset);
+                            //printf("address = x%x, p64 = %p* p64 = x%llx\n", r.offset, p64, *p64);
+                            *p64 += machobj.section_64s[SegData[r.targseg].SDshtidx].addr -
+                                  (machobj.section_64s[pseg.SDshtidx].addr + r.funcsym.Slocalgotoffset + _tysize[TYnptr]);
+                        }
+                        else
+                        {
+                            int32_t* p = patchAddr(seg, r.offset);
+                            //printf("address = x%x, p = %p* p = x%x\n", r.offset, p, *p);
+                            if (r.funcsym)
+                                *p += machobj.sections[SegData[r.targseg].SDshtidx].addr -
+                                      (machobj.sections[pseg.SDshtidx].addr + r.funcsym.Slocalgotoffset + _tysize[TYnptr]);
+                            else
+                                // targ_address - fixup_address
+                                *p += machobj.sections[SegData[r.targseg].SDshtidx].addr -
+                                      (psechdr.addr + r.offset);
+                        }
+                        continue;
+                    }
+                    else
+                    {
+                        //printf("rs: REL.%s r.targseg: %d r.offset: x%llx\n", rs, r.targseg, cast(long)r.offset);
+                        rel.r_address = cast(int)r.offset;
+                        rel.r_symbolnum = table[r.targseg];
+                        rel.r_pcrel = (r.rtype == REL.address) ? 0 : 1;
+                        //printf("r_pcrel: %d\n", rel.r_pcrel);
+                        rel.r_length = (r.rtype == REL.address) ? 3 : 2;
+                        rel.r_extern = 0;
+                        rel.r_type = ARM64_RELOC_UNSIGNED;
+
+                        machobj.fobjbuf.write(&rel, rel.sizeof);
+                        foffset += rel.sizeof;
+                        nreloc++;
+
+                        int32_t* p64 = patchAddr64(seg, r.offset);
+static if (1)
+{
+                        if (rel.r_pcrel)
+                            // Relative address
+                            patch(pseg, r.offset, r.targseg, 0);
+                        else
+                        {   // Absolute address; add in addr of start of targ seg
+//printf("*p = x%x, targ.addr = x%x\n", *p64, cast(int)machobj.section_64s[SegData[r.targseg].SDshtidx].addr);
+//printf("pseg = x%x, r.offset = x%x\n", cast(int)machobj.section_64s[pseg.SDshtidx].addr, cast(int)r.offset);
+                            *p64 += machobj.section_64s[SegData[r.targseg].SDshtidx].addr;
+                            //*p64 -= machobj.section_64s[pseg.SDshtidx].addr;
+                        }
+}
+                        //printf("%d:x%04x before = x%04llx, after = x%04llx pcrel = %d\n", seg, r.offset, before, *p64, rel.r_pcrel);
+                        continue;
+                    }
+                }
+                else // *************** X86_64 ***************** //
+                {
+                    if (s)
+                    {
+                        //printf("Relocation\n");
+                        //symbol_print(*s);
+                        if (r.subtractor)  // emit SUBTRACTOR/UNSIGNED pair
+                        {
+                            if (I64)
+                            {
+                                rel.r_type = X86_64_RELOC_SUBTRACTOR;
+                                rel.r_address = cast(int)r.offset;
+                                rel.r_symbolnum = r.funcsym.Sxtrnnum;
+assert(rel.r_symbolnum);
+                                rel.r_pcrel = 0;
+                                rel.r_length = 3;
+                                rel.r_extern = 1;
+                                machobj.fobjbuf.write(&rel, rel.sizeof);
+                                foffset += (rel).sizeof;
+                                ++nreloc;
+
+                                rel.r_type = X86_64_RELOC_UNSIGNED;
+                                rel.r_symbolnum = s.Sxtrnnum;
+assert(rel.r_symbolnum);
+                                machobj.fobjbuf.write(&rel, rel.sizeof);
+                                foffset += rel.sizeof;
+                                ++nreloc;
+
+                                // patch with fdesym.Soffset - offset
+                                long* p = cast(long*)patchAddr64(seg, r.offset);
+                                *p += r.funcsym.Soffset - r.offset;
+                                continue;
+                            }
+                            else
+                            {
+                                // address = segment + offset
+                                int targ_address = cast(int)(machobj.sections[SegData[s.Sseg].SDshtidx].addr + s.Soffset);
+                                int fixup_address = cast(int)(psechdr.addr + r.offset);
+
+                                srel.r_scattered = 1;
+                                srel.r_type = GENERIC_RELOC_LOCAL_SECTDIFF;
+                                srel.r_address = cast(uint)r.offset;
+                                srel.r_pcrel = 0;
+                                srel.r_length = 2;
+                                srel.r_value = targ_address;
+                                machobj.fobjbuf.write((&srel)[0 .. 1]);
+                                foffset += srel.sizeof;
+                                ++nreloc;
+
+                                srel.r_type = GENERIC_RELOC_PAIR;
+                                srel.r_address = 0;
+                                srel.r_value = fixup_address;
+                                machobj.fobjbuf.write(&srel, srel.sizeof);
+                                foffset += srel.sizeof;
+                                ++nreloc;
+
+                                int32_t* p = patchAddr(seg, r.offset);
+                                *p += targ_address - fixup_address;
+                                continue;
+                            }
+                        }
+                        else if (pseg.isCode())
+                        {
+                            if (I64)
+                            {
+                                //printf("I64\n");
+                                //symbol_print(*s);
+                                rel.r_type = (r.rtype == REL.rel)
+                                        ? X86_64_RELOC_BRANCH
+                                        : X86_64_RELOC_SIGNED;
+                                if (r.val == -1)
+                                    rel.r_type = X86_64_RELOC_SIGNED_1;
+                                else if (r.val == -2)
+                                    rel.r_type = X86_64_RELOC_SIGNED_2;
+                                if (r.val == -4)
+                                    rel.r_type = X86_64_RELOC_SIGNED_4;
+
+                                if (s.Sclass == SC.extern_ ||
+                                    s.Sclass == SC.comdef  ||
+                                    s.Sclass == SC.comdat  ||
+                                    s.Sclass == SC.static_ ||
+                                    s.Sclass == SC.global)
+                                {
+                                    if ((s.ty() & mTYLINK) == mTYthread && r.rtype == REL.address)
+                                        rel.r_type = X86_64_RELOC_TLV;
+                                    else if (s.Sfl == FL.func && s.Sclass == SC.static_ && r.rtype == REL.address)
+                                        rel.r_type = X86_64_RELOC_SIGNED;
+                                    else if ((s.Sfl == FL.func || s.Sfl == FL.extern_ || s.Sclass == SC.global ||
+                                              s.Sclass == SC.comdat || s.Sclass == SC.comdef) && r.rtype == REL.address)
+                                        rel.r_type = X86_64_RELOC_GOT;
+
+                                    rel.r_address = cast(int)r.offset;
+                                    rel.r_symbolnum = s.Sxtrnnum;
+if (machobj.AArch64 && !rel.r_symbolnum)
+{
+    printf("symbol %p '%s'\n ", s, s.Sident.ptr);
+    printf(" Sclass = SC.%s ", class_str(s.Sclass));
+    printf(" Sxtrnnum = %d",cast(int)s.Sxtrnnum);
+    printf(" Sfl = %s\n", fl_str(cast(FL) s.Sfl));
+}
+assert(rel.r_symbolnum);
+                                    rel.r_pcrel = 1;
+                                    rel.r_length = 2;
+                                    rel.r_extern = 1;
+                                    machobj.fobjbuf.write(&rel, rel.sizeof);
+                                    foffset += rel.sizeof;
+                                    nreloc++;
+                                    continue;
+                                }
+                                else
+                                {
+                                    rel.r_address = cast(int)r.offset;
+                                    rel.r_symbolnum = table[s.Sseg];
+assert(rel.r_symbolnum);
+                                    rel.r_pcrel = 1;
+                                    rel.r_length = 2;
+                                    rel.r_extern = 0;
+                                    machobj.fobjbuf.write(&rel, rel.sizeof);
+                                    foffset += rel.sizeof;
+                                    nreloc++;
+
+                                    int32_t* p = patchAddr64(seg, r.offset);
+                                    // Absolute address; add in addr of start of targ seg
+    //printf("*p = x%x, .addr = x%x, Soffset = x%x\n", *p, cast(int)machobj.section_64s[SegData[s.Sseg].SDshtidx].addr, cast(int)s.Soffset);
+    //printf("pseg = x%x, r.offset = x%x\n", cast(int)machobj.section_64s[pseg.SDshtidx].addr, cast(int)r.offset);
+                                    *p += machobj.section_64s[SegData[s.Sseg].SDshtidx].addr;
+                                    *p += s.Soffset;
+                                    *p -= machobj.section_64s[pseg.SDshtidx].addr + r.offset + 4;
+                                    //patch(pseg, r.offset, s.Sseg, s.Soffset);
+                                    continue;
+                                }
+                            }
+                        }
+                        else
+                        {
+                            if (s.Sclass == SC.extern_ ||
+                                s.Sclass == SC.comdef ||
+                                s.Sclass == SC.comdat)
+                            {
+                                rel.r_address = cast(int)r.offset;
+                                rel.r_symbolnum = s.Sxtrnnum;
+assert(rel.r_symbolnum);
+                                rel.r_pcrel = 0;
+                                rel.r_length = 2;
+                                rel.r_extern = 1;
+                                rel.r_type = GENERIC_RELOC_VANILLA;
+                                if (I64)
+                                {
+                                    rel.r_type = X86_64_RELOC_UNSIGNED;
+                                    rel.r_length = 3;
+                                }
+                                machobj.fobjbuf.write(&rel, rel.sizeof);
+                                foffset += rel.sizeof;
+                                nreloc++;
+                                continue;
+                            }
+                            else
+                            {
+                                rel.r_address = cast(int)r.offset;
+                                rel.r_symbolnum = table[s.Sseg];
+assert(rel.r_symbolnum);
+                                rel.r_pcrel = 0;
+                                rel.r_length = 2;
+                                rel.r_extern = 0;
+                                rel.r_type = GENERIC_RELOC_VANILLA;
+                                if (I64)
+                                {
+                                    rel.r_type = X86_64_RELOC_UNSIGNED;
+                                    rel.r_length = 3;
+                                    if (0 && s.Sseg != seg)
+                                        rel.r_type = X86_64_RELOC_BRANCH;
+                                }
+                                machobj.fobjbuf.write(&rel, rel.sizeof);
+                                foffset += rel.sizeof;
+                                nreloc++;
+                                if (I64)
+                                {
+                                    rel.r_length = 3;
+                                    int32_t* p = patchAddr64(seg, r.offset);
+                                    // Absolute address; add in addr of start of targ seg
+                                    *p += machobj.section_64s[SegData[s.Sseg].SDshtidx].addr + s.Soffset;
+                                    //patch(pseg, r.offset, s.Sseg, s.Soffset);
+                                }
+                                else
+                                {
+                                    int32_t* p = patchAddr(seg, r.offset);
+                                    // Absolute address; add in addr of start of targ seg
+                                    *p += machobj.sections[SegData[s.Sseg].SDshtidx].addr + s.Soffset;
+                                    //patch(pseg, r.offset, s.Sseg, s.Soffset);
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                    else if (r.rtype == REL.address && pseg.isCode())
+                    {
+                        srel.r_scattered = 1;
+
+                        srel.r_address = cast(uint)r.offset;
+                        srel.r_length = 2;
+                        if (I64)
+                        {
+                            int32_t* p64 = patchAddr64(seg, r.offset);
+                            srel.r_type = X86_64_RELOC_GOT;
+                            srel.r_value = cast(int)(machobj.section_64s[SegData[r.targseg].SDshtidx].addr + *p64);
+                            //printf("SECTDIFF: x%llx + x%llx = x%x\n", machobj.sections[SegData[r.targseg].SDshtidx].addr, *p, srel.r_value);
+                        }
+                        else
+                        {
+                            int32_t* p = patchAddr(seg, r.offset);
+                            srel.r_type = GENERIC_RELOC_LOCAL_SECTDIFF;
+                            srel.r_value = machobj.sections[SegData[r.targseg].SDshtidx].addr + *p;
+                            //printf("SECTDIFF: x%x + x%x = x%x\n", machobj.sections[SegData[r.targseg].SDshtidx].addr, *p, srel.r_value);
+                        }
+                        srel.r_pcrel = 0;
+                        machobj.fobjbuf.write(&srel, srel.sizeof);
+                        foffset += srel.sizeof;
+                        nreloc++;
+
+                        srel.r_address = 0;
+                        srel.r_length = 2;
+                        if (I64)
+                        {
+                            srel.r_type = X86_64_RELOC_SIGNED;
+                            srel.r_value = cast(int)(machobj.section_64s[pseg.SDshtidx].addr +
+                                    r.funcsym.Slocalgotoffset + _tysize[TYnptr]);
+                        }
+                        else
+                        {
+                            srel.r_type = GENERIC_RELOC_PAIR;
+                            if (r.funcsym)
+                                srel.r_value = cast(int)(machobj.sections[pseg.SDshtidx].addr +
+                                        r.funcsym.Slocalgotoffset + _tysize[TYnptr]);
+                            else
+                                srel.r_value = cast(int)(psechdr.addr + r.offset);
+                            //printf("srel.r_value = x%x, psechdr.addr = x%x, r.offset = x%x\n",
+                                //cast(int)srel.r_value, cast(int)psechdr.addr, cast(int)r.offset);
+                        }
+                        srel.r_pcrel = 0;
+                        machobj.fobjbuf.write(&srel, srel.sizeof);
+                        foffset += srel.sizeof;
+                        nreloc++;
+
+                        // Recalc due to possible realloc of machobj.fobjbuf.buf
+                        if (I64)
+                        {
+                            int32_t* p64 = patchAddr64(seg, r.offset);
+                            //printf("address = x%x, p64 = %p* p64 = x%llx\n", r.offset, p64, *p64);
+                            *p64 += machobj.section_64s[SegData[r.targseg].SDshtidx].addr -
+                                  (machobj.section_64s[pseg.SDshtidx].addr + r.funcsym.Slocalgotoffset + _tysize[TYnptr]);
+                        }
+                        else
+                        {
+                            int32_t* p = patchAddr(seg, r.offset);
+                            //printf("address = x%x, p = %p* p = x%x\n", r.offset, p, *p);
+                            if (r.funcsym)
+                                *p += machobj.sections[SegData[r.targseg].SDshtidx].addr -
+                                      (machobj.sections[pseg.SDshtidx].addr + r.funcsym.Slocalgotoffset + _tysize[TYnptr]);
+                            else
+                                // targ_address - fixup_address
+                                *p += machobj.sections[SegData[r.targseg].SDshtidx].addr -
+                                      (psechdr.addr + r.offset);
+                        }
+                        continue;
+                    }
+                    else
+                    {
+                        //printf("r.rtype: %d r.targseg: %d r.offset: x%llx\n", r.rtype, r.targseg, cast(long)r.offset);
+                        rel.r_address = cast(int)r.offset;
+                        rel.r_symbolnum = table[r.targseg];
+assert(rel.r_symbolnum);
+                        rel.r_pcrel = (r.rtype == REL.address) ? 0 : 1;
+                        rel.r_length = 2;
+                        rel.r_extern = 0;
+                        rel.r_type = GENERIC_RELOC_VANILLA;
+                        if (I64)
+                        {
+                            rel.r_type = X86_64_RELOC_UNSIGNED;
+                            rel.r_length = 3;
+                            if (0 && r.targseg != seg)
+                                rel.r_type = X86_64_RELOC_BRANCH;
+                        }
+                        machobj.fobjbuf.write(&rel, rel.sizeof);
+                        foffset += rel.sizeof;
+                        nreloc++;
+                        if (I64)
+                        {
+                            int32_t* p64 = patchAddr64(seg, r.offset);
+                            //long before = *p64;
+                            if (rel.r_pcrel)
+                                // Relative address
+                                patch(pseg, r.offset, r.targseg, 0);
+                            else
+                            {   // Absolute address; add in addr of start of targ seg
+    //printf("*p = x%x, targ.addr = x%x\n", *p64, cast(int)machobj.section_64s[SegData[r.targseg].SDshtidx].addr);
+    //printf("pseg = x%x, r.offset = x%x\n", cast(int)machobj.section_64s[pseg.SDshtidx].addr, cast(int)r.offset);
+                                *p64 += machobj.section_64s[SegData[r.targseg].SDshtidx].addr;
+                                //*p64 -= machobj.section_64s[pseg.SDshtidx].addr;
+                            }
+                            //printf("%d:x%04x before = x%04llx, after = x%04llx pcrel = %d\n", seg, r.offset, before, *p64, rel.r_pcrel);
+                        }
+                        else
+                        {
+                            int32_t* p = patchAddr(seg, r.offset);
+                            //int32_t before = *p;
+                            if (rel.r_pcrel)
+                                // Relative address
+                                patch(pseg, r.offset, r.targseg, 0);
+                            else
+                                // Absolute address; add in addr of start of targ seg
+                                *p += machobj.sections[SegData[r.targseg].SDshtidx].addr;
+                            //printf("%d:x%04x before = x%04x, after = x%04x pcrel = %d\n", seg, r.offset, before, *p, rel.r_pcrel);
+                        }
+                        continue;
+                    }
+                }
+            }
+        }
+        if (nreloc)
+        {
+            if (I64)
+            {
+                psechdr64.reloff = reloff;
+                psechdr64.nreloc = nreloc;
+            }
+            else
+            {
+                psechdr.reloff = reloff;
+                psechdr.nreloc = nreloc;
+            }
+        }
+    }
+
+    // Put out symbol table
+    foffset = elf_align(I64 ? 8 : 4, foffset);
+    symtab_cmd.symoff = foffset;
+    dysymtab_cmd.ilocalsym = 0;
+    dysymtab_cmd.nlocalsym  = cast(uint)machobj.localSymbols.length;
+    dysymtab_cmd.iextdefsym = dysymtab_cmd.nlocalsym;
+    dysymtab_cmd.nextdefsym = cast(uint)machobj.publicSymbols.length;
+    dysymtab_cmd.iundefsym = dysymtab_cmd.iextdefsym + dysymtab_cmd.nextdefsym;
+    int nexterns = cast(int)machobj.externSymbols.length;
+    int ncomdefs = cast(int)machobj.comdefs.length;
+    dysymtab_cmd.nundefsym  = nexterns + ncomdefs;
+    symtab_cmd.nsyms =  dysymtab_cmd.nlocalsym +
+                        dysymtab_cmd.nextdefsym +
+                        dysymtab_cmd.nundefsym;
+    machobj.fobjbuf.reserve(cast(uint)(symtab_cmd.nsyms * (I64 ? nlist_64.sizeof : nlist.sizeof)));
+
+    ubyte remap(uint seg)
+    {
+        if (!machobj.AArch64)
+            return cast(ubyte)seg;
+        return cast(ubyte)table[seg];
+    }
+
+    foreach (s; machobj.localSymbols[])
+    {
+        //printf("Writing local symbol %d:x%x %s\n", s.Sseg, cast(int)s.Soffset, s.Sident.ptr);
+        nlist_64 sym;
+        sym.n_strx = mach_addmangled(s);
+        sym.n_type = N_SECT;
+        sym.n_desc = 0;
+        if (s.Sclass == SC.comdat)
+            sym.n_desc = N_WEAK_DEF;
+        sym.n_sect = remap(s.Sseg);
+        if (I64)
+        {
+            sym.n_value = s.Soffset + machobj.section_64s[SegData[s.Sseg].SDshtidx].addr;
+            machobj.fobjbuf.write(&sym, sym.sizeof);
+        }
+        else
+        {
+            nlist sym32;
+            sym32.n_strx = sym.n_strx;
+            sym32.n_value = cast(uint)(s.Soffset + machobj.sections[SegData[s.Sseg].SDshtidx].addr);
+            sym32.n_type = sym.n_type;
+            sym32.n_desc = sym.n_desc;
+            sym32.n_sect = sym.n_sect;
+            machobj.fobjbuf.write(&sym32, sym32.sizeof);
+        }
+    }
+    foreach (s; machobj.publicSymbols[])
+    {
+        //printf("Writing public symbol %d:x%x %s\n", s.Sseg, cast(int)s.Soffset, s.Sident.ptr);
+        nlist_64 sym;
+        sym.n_strx = mach_addmangled(s);
+        sym.n_type = N_EXT | N_SECT;
+        if (s.Sflags & SFLhidden)
+            sym.n_type |= N_PEXT; // private extern
+        sym.n_desc = 0;
+        if (s.Sclass == SC.comdat)
+            sym.n_desc = N_WEAK_DEF;
+        sym.n_sect = remap(s.Sseg);
+        if (I64)
+        {
+            sym.n_value = s.Soffset + machobj.section_64s[SegData[s.Sseg].SDshtidx].addr;
+            machobj.fobjbuf.write(&sym, sym.sizeof);
+        }
+        else
+        {
+            nlist sym32;
+            sym32.n_strx = sym.n_strx;
+            sym32.n_value = cast(uint)(s.Soffset + machobj.sections[SegData[s.Sseg].SDshtidx].addr);
+            sym32.n_type = sym.n_type;
+            sym32.n_desc = sym.n_desc;
+            sym32.n_sect = sym.n_sect;
+            machobj.fobjbuf.write(&sym32, sym32.sizeof);
+        }
+    }
+    foreach (s; machobj.externSymbols[])
+    {
+        //printf("Writing extern symbol %d:x%x %s\n", s.Sseg, cast(int)s.Soffset, s.Sident.ptr);
+        nlist_64 sym;
+        sym.n_strx = mach_addmangled(s);
+        sym.n_value = s.Soffset;
+        sym.n_type = N_EXT | N_UNDF;
+        sym.n_desc = tyfunc(s.ty()) ? REFERENCE_FLAG_UNDEFINED_LAZY
+                                     : REFERENCE_FLAG_UNDEFINED_NON_LAZY;
+        sym.n_sect = 0;
+        if (I64)
+            machobj.fobjbuf.write(&sym, sym.sizeof);
+        else
+        {
+            nlist sym32;
+            sym32.n_strx = sym.n_strx;
+            sym32.n_value = cast(uint)sym.n_value;
+            sym32.n_type = sym.n_type;
+            sym32.n_desc = sym.n_desc;
+            sym32.n_sect = sym.n_sect;
+            machobj.fobjbuf.write(&sym32, sym32.sizeof);
+        }
+    }
+    foreach (ref c; machobj.comdefs)
+    {
+        Symbol* s = c.sym;
+        //printf("Writing comdef symbol %d:x%x %s\n", table[table[s.Sseg]], cast(int)s.Soffset, s.Sident.ptr);
+        nlist_64 sym;
+        sym.n_strx = mach_addmangled(c.sym);
+        sym.n_value = c.size * c.count;
+        sym.n_type = N_EXT | N_UNDF;
+        int p2align;
+        if (c.size < 2)
+            p2align = 0;          // p2align is expressed as power of 2
+        else if (c.size < 4)
+            p2align = 1;
+        else if (c.size < 8)
+            p2align = 2;
+        else if (c.size < 16)
+            p2align = 3;
+        else
+            p2align = 4;
+        sym.n_desc = cast(ushort)(p2align << 8);
+        sym.n_sect = 0;
+        if (I64)
+            machobj.fobjbuf.write(&sym, sym.sizeof);
+        else
+        {
+            nlist sym32;
+            sym32.n_strx = sym.n_strx;
+            sym32.n_value = cast(uint)sym.n_value;
+            sym32.n_type = sym.n_type;
+            sym32.n_desc = sym.n_desc;
+            sym32.n_sect = sym.n_sect;
+            machobj.fobjbuf.write(&sym32, sym32.sizeof);
+        }
+    }
+    if (machobj.extdef)
+    {
+        nlist_64 sym;
+        sym.n_strx = machobj.extdef;
+        sym.n_value = 0;
+        sym.n_type = N_EXT | N_UNDF;
+        sym.n_desc = 0;
+        sym.n_sect = 0;
+        if (I64)
+            machobj.fobjbuf.write(&sym, sym.sizeof);
+        else
+        {
+            nlist sym32;
+            sym32.n_strx = sym.n_strx;
+            sym32.n_value = cast(uint)sym.n_value;
+            sym32.n_type = sym.n_type;
+            sym32.n_desc = sym.n_desc;
+            sym32.n_sect = sym.n_sect;
+            machobj.fobjbuf.write(&sym32, sym32.sizeof);
+        }
+        dysymtab_cmd.nundefsym++;
+        symtab_cmd.nsyms++;
+    }
+    foffset += symtab_cmd.nsyms * (I64 ? nlist_64.sizeof : nlist.sizeof);
+
+    // Put out string table
+    foffset = elf_align(I64 ? 8 : 4, foffset);
+    symtab_cmd.stroff = foffset;
+    symtab_cmd.strsize = cast(uint)machobj.symtab_strings.length();
+    machobj.fobjbuf.write(machobj.symtab_strings.buf, symtab_cmd.strsize);
+    foffset += symtab_cmd.strsize;
+
+    // Put out indirectsym table, which is in two parts
+    foffset = elf_align(I64 ? 8 : 4, foffset);
+    dysymtab_cmd.indirectsymoff = foffset;
+    if (machobj.indirectSymbols1.length)
+    {
+        dysymtab_cmd.nindirectsyms += machobj.indirectSymbols1.length;
+        for (int i = 0; i < dysymtab_cmd.nindirectsyms; i++)
+        {   Symbol* s = machobj.indirectSymbols1[i];
+            assert(s.Sxtrnnum < symtab_cmd.nsyms);
+            machobj.fobjbuf.write32(s.Sxtrnnum);
+        }
+    }
+    if (machobj.indirectSymbols2.length)
+    {
+        dysymtab_cmd.nindirectsyms += machobj.indirectSymbols2.length;
+        for (int i = 0; i < dysymtab_cmd.nindirectsyms; i++)
+        {   Symbol* s = machobj.indirectSymbols2[i];
+            assert(s.Sxtrnnum < symtab_cmd.nsyms);
+            machobj.fobjbuf.write32(s.Sxtrnnum);
+        }
+    }
+    foffset += dysymtab_cmd.nindirectsyms * 4;
+    if (dysymtab_cmd.nindirectsyms == 0)
+        dysymtab_cmd.indirectsymoff = 0;        // otherwise it may point past the end of LC_DYSYMTAB
+
+    /* The correct offsets are now determined, so
+     * rewind and fix the header.
+     */
+    machobj.fobjbuf.position(headersize, sizeofcmds);
+    if (I64)
+    {
+        machobj.fobjbuf.write(&segment_cmd64, segment_cmd64.sizeof);
+        //machobj.fobjbuf.write(&machobj.section_64s[1], machobj.section_length * section_64.sizeof);
+        foreach (i; 1 .. table.length)
+        {
+            machobj.fobjbuf.write(&machobj.section_64s[order[i]], section_64.sizeof);
+        }
+    }
+    else
+    {
+        machobj.fobjbuf.write(&segment_cmd, segment_cmd.sizeof);
+        //machobj.fobjbuf.write(&machobj.sections[1], machobj.section_length * section.sizeof);
+        foreach (i; 1 .. table.length)
+        {
+            machobj.fobjbuf.write(&machobj.sections[table[i]], section_64.sizeof);
+        }
+    }
+    machobj.fobjbuf.write(version_command.data, version_command.size);
+    machobj.fobjbuf.write(&symtab_cmd, symtab_cmd.sizeof);
+    machobj.fobjbuf.write(&dysymtab_cmd, dysymtab_cmd.sizeof);
+    machobj.fobjbuf.position(foffset, 0);
+
+    mem_free(table.ptr);
+    mem_free(order.ptr);
+
+    /* Set Sxtrnnum to zero for symbols so we know they are not in the
+     * object file's symbol table.
+     */
+    if (machobj.AArch64)
+    foreach (s; machobj.externSymbols[])
+        s.Sxtrnnum = 0;
+}
+
+/*****************************
+ * Line number support.
+ */
+
+/***************************
+ * Record file and line number at segment and offset.
+ * The actual .debug_line segment is put out by dwarf_termfile().
+ * Params:
+ *      srcpos = source file position
+ *      seg = segment it corresponds to
+ *      offset = offset within seg
+ */
+@trusted
+void MachObj_linnum(Srcpos srcpos, int seg, targ_size_t offset)
+{
+    if (srcpos.Slinnum == 0)
+        return;
+
+    if (log)
+    {
+        debug printf("MachObj_linnum(seg=%d, offset=x%llx) ", seg, cast(ulong)offset);
+        srcpos.print("");
+    }
+
+    if (!srcpos.Sfilename)
+        return;
+
+    size_t i;
+    seg_data* pseg = SegData[seg];
+
+    // Find entry i in SDlinnum_data[] that corresponds to srcpos filename
+    for (i = 0; 1; i++)
+    {
+        if (i == pseg.SDlinnum_data.length)
+        {   // Create new entry
+            pseg.SDlinnum_data.push(linnum_data(srcpos.Sfilename));
+            break;
+        }
+        if (pseg.SDlinnum_data[i].filename == srcpos.Sfilename)
+            break;
+    }
+
+    linnum_data* ld = &pseg.SDlinnum_data[i];
+//    printf("i = %d, ld = x%x\n", i, ld);
+    ld.linoff.push(LinOff(srcpos.Slinnum, cast(uint)offset));
+}
+
+
+/*******************************
+ * Set start address
+ */
+
+void MachObj_startaddress(Symbol* s)
+{
+    //dbg_printf("MachObj_startaddress(Symbol *%s)\n",s.Sident);
+    //obj.startaddress = s;
+}
+
+/*******************************
+ * Output library name.
+ */
+
+bool MachObj_includelib(scope const char[] name)
+{
+    //dbg_printf("MachObj_includelibx(name *%s)\n",name);
+    return false;
+}
+
+/*******************************
+* Output linker directive.
+*/
+
+bool MachObj_linkerdirective(scope const(char)* name)
+{
+    return false;
+}
+
+/**********************************
+ * Do we allow zero sized objects?
+ */
+
+bool MachObj_allowZeroSize()
+{
+    return true;
+}
+
+/**************************
+ * Embed string in executable.
+ */
+
+void MachObj_exestr(const(char)* p)
+{
+    //dbg_printf("MachObj_exestr(char *%s)\n",p);
+}
+
+/**************************
+ * Embed string in obj.
+ */
+
+void MachObj_user(const(char)* p)
+{
+    //dbg_printf("MachObj_user(char *%s)\n",p);
+}
+
+/*******************************
+ * Output a weak extern record.
+ */
+
+void MachObj_wkext(Symbol* s1,Symbol* s2)
+{
+    //dbg_printf("MachObj_wkext(Symbol *%s,Symbol* s2)\n",s1.Sident.ptr,s2.Sident.ptr);
+}
+
+/*******************************
+ * Output file name record.
+ *
+ * Currently assumes that obj_filename will not be called
+ *      twice for the same file.
+ */
+
+void MachObj_filename(const(char)* modname)
+{
+    //dbg_printf("MachObj_filename(char *%s)\n",modname);
+    // Not supported by Mach-O
+}
+
+/*******************************
+ * Embed compiler version in .obj file.
+ */
+
+void MachObj_compiler(const(char)* p)
+{
+    //dbg_printf("MachObj_compiler\n");
+    MachObj_user(p);
+}
+
+
+/**************************************
+ * Symbol is the function that calls the static constructors.
+ * Put a pointer to it into a special segment that the startup code
+ * looks at.
+ * Input:
+ *      s       static constructor function
+ *      dtor    !=0 if leave space for static destructor
+ *      seg     1:      user
+ *              2:      lib
+ *              3:      compiler
+ */
+
+void MachObj_staticctor(Symbol* s, int, int)
+{
+    MachObj_setModuleCtorDtor(s, true);
+}
+
+/**************************************
+ * Symbol is the function that calls the static destructors.
+ * Put a pointer to it into a special segment that the exit code
+ * looks at.
+ * Input:
+ *      s       static destructor function
+ */
+
+void MachObj_staticdtor(Symbol* s)
+{
+    MachObj_setModuleCtorDtor(s, false);
+}
+
+
+/***************************************
+ * Stuff pointer to function in its own segment.
+ * Used for static ctor and dtor lists.
+ */
+@trusted
+void MachObj_setModuleCtorDtor(Symbol* sfunc, bool isCtor)
+{
+    const p2align = I64 ? 3 : 2; // align to _tysize[TYnptr]
+
+    IDXSEC seg = isCtor
+                ? getsegment2(machobj.seg_mod_init_func, "__mod_init_func", "__DATA", p2align, S_MOD_INIT_FUNC_POINTERS)
+                : getsegment2(machobj.seg_mod_term_func, "__mod_term_func", "__DATA", p2align, S_MOD_TERM_FUNC_POINTERS);
+
+    const int relflags = I64 ? CF.off | CF.offset64 : CF.off;
+    const int sz = MachObj_reftoident(seg, SegData[seg].SDoffset, sfunc, 0, relflags);
+    SegData[seg].SDoffset += sz;
+}
+
+
+/***************************************
+ * Stuff the following data (instance of struct FuncTable) in a separate segment:
+ *      pointer to function
+ *      pointer to ehsym
+ *      length of function
+ */
+@trusted
+void MachObj_ehtables(Symbol* sfunc,uint size,Symbol* ehsym)
+{
+    //dbg_printf("MachObj_ehtables(%s) \n",sfunc.Sident.ptr);
+    assert(0);                  // converted to Dwarf EH debug format
+}
+
+/*********************************************
+ * Put out symbols that define the beginning/end of the .deh_eh section.
+ * This gets called if this is the module with "main()" in it.
+ */
+
+void MachObj_ehsections()
+{
+    //printf("MachObj_ehsections()\n");
+}
+
+/*********************************
+ * Setup for Symbol s to go into a COMDAT segment.
+ * Output (if s is a function):
+ *      cseg            segment index of new current code segment
+ *      Offset(cseg)         starting offset in cseg
+ * Returns:
+ *      "segment index" of COMDAT
+ */
+
+int MachObj_comdatsize(Symbol* s, targ_size_t symsize)
+{
+    return MachObj_comdat(s);
+}
+
+@trusted
+int MachObj_comdat(Symbol* s)
+{
+    //printf("MachObj_comdat(Symbol* %s)\n",s.Sident.ptr);
+    //symbol_print(*s);
+    //symbol_debug(s);
+
+    int p2align;
+    if (config.target_cpu == TARGET_AArch64 && config.objfmt == OBJ_MACH)
+    {
+        /* write out the symbol with an n_desc of N_WEAK_DEF
+         * instead of writing into special segments
+         */
+        if (tyfunc(s.ty()))
+        {
+            p2align = 2;              // 4 byte alignment
+            s.Sseg = cseg;            // functions go into cseg
+        }
+        else if ((s.ty() & mTYLINK) == mTYweakLinkage) // used by Objc
+        {
+            s.Sfl = FL.data;
+            p2align = 4;              // 16 byte alignment
+            MachObj_data_start(s, 1 << p2align, s.Sseg);
+        }
+        else if ((s.ty() & mTYLINK) == mTYthread)
+        {
+            s.Sfl = FL.tlsdata;
+            p2align = 4;
+            //MachObj_tlsseg();
+            //s.Sseg = machobj.seg_tlsseg;
+            s.Sseg = objmod.tlsseg().SDseg;
+            MachObj_data_start(s, 1 << p2align, s.Sseg);
+        }
+        else
+        {
+            s.Sfl = FL.data;
+            p2align = 4;              // 16 byte alignment
+            s.Sseg = DATA;
+            MachObj_data_start(s, 1 << p2align, s.Sseg);
+        }
+    }
+    else
+    {
+        if (tyfunc(s.ty()))
+        {
+            const(char)* sectname = "__textcoal_nt";
+            const(char)* segname = "__TEXT";
+            p2align = 2;              // 4 byte alignment
+            int flags = S_COALESCED | S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS;
+            s.Sseg = getsegment2(machobj.seg_textcoal_nt, sectname, segname, p2align, flags);
+        }
+        else if ((s.ty() & mTYLINK) == mTYweakLinkage)
+        {
+            s.Sfl = FL.data;
+            p2align = 4;              // 16 byte alignment
+            MachObj_data_start(s, 1 << p2align, s.Sseg);
+        }
+        else if ((s.ty() & mTYLINK) == mTYthread)
+        {
+            s.Sfl = FL.tlsdata;
+            p2align = 4;
+            if (I64)
+                s.Sseg = objmod.tlsseg().SDseg;
+            else
+                s.Sseg = getsegment2(machobj.seg_tlscoal_nt, "__tlscoal_nt", "__DATA", p2align, S_COALESCED);
+            MachObj_data_start(s, 1 << p2align, s.Sseg);
+        }
+        else
+        {
+            s.Sfl = FL.data;
+            const(char)* sectname = "__datacoal_nt";
+            const(char)* segname = "__DATA";
+            p2align = 4;              // 16 byte alignment
+            s.Sseg = getsegment2(machobj.seg_datacoal_nt, sectname, segname, p2align, S_COALESCED);
+            MachObj_data_start(s, 1 << p2align, s.Sseg);
+        }
+    }
+                                // find or create new segment
+    if (s.Salignment > (1 << p2align))
+        SegData[s.Sseg].SDalignment = s.Salignment;
+    s.Soffset = SegData[s.Sseg].SDoffset;
+    if (s.Sfl == FL.data || s.Sfl == FL.tlsdata)
+    {   // Code symbols are 'published' by MachObj_func_start()
+
+        MachObj_pubdef(s.Sseg,s,s.Soffset);
+    }
+    return s.Sseg;
+}
+
+int MachObj_readonly_comdat(Symbol* s)
+{
+    assert(0);
+}
+
+/* Arm64 __LD, __compact_unwind section
+Layout:
+
+struct compact_unwind_entry_64 {
+    uint64_t  function_start;     // address of function (or range start)
+    uint32_t  function_length;    // length of the function/range
+    uint32_t  encoding;           // 32-bit compact unwind encoding
+    uint64_t  personality;        // pointer to personality function (or 0)
+    uint64_t  lsda;               // pointer to LSDA (language-specific data area) or 0
+};
+
+Encoding:
+
+Bits Meaning
+31 IS_NOT_FUNCTION_START
+30 HAS_LSDA
+29-28 Personality index (0-3)
+27-24 Mode
+
+arm64 modes (most relevant today):
+0x02000000 - Frameless (leaf function)
+0x04000000 - Frame-based (standard stp x29,x30 prologue)
+0x03000000 - DWARF fallback (points into __eh_frame)
+
+# See the raw compact unwind section in an object file
+otool -s __LD __compact_unwind myfile.o -v
+
+See the canonical reference for all bitfields in LLVM:
+https://github.com/llvm/llvm-project/blob/main/libunwind/include/mach-o/compact_unwind_encoding.h
+*/
+
+/***********************************
+ * Returns:
+ *      jump table segment for function s
+ */
+@trusted
+int MachObj_jmpTableSegment(Symbol* s)
+{
+    return (config.flags & CFGromable) ? cseg : CDATA;
+}
+
+/**********************************
+ * Get segment.
+ * Input:
+ *      p2align  segment alignment as power of 2
+ * Returns:
+ *      segment index of found or newly created segment
+ */
+@trusted
+int MachObj_getsegment(const(char)* sectname, const(char)* segname,
+        int p2align, int flags)
+{
+    //printf("MachObj_getsegment(%s, %s)\n", sectname, segname);
+    if (strlen(sectname) > 16)
+    {
+        error(Srcpos.init, "invalid section name, length too long for `%s`", sectname);
+        return 0;
+    }
+
+    if (strlen(segname) > 16)
+    {
+        error(Srcpos.init, "invalid segment name, length too long for `%s`", segname);
+        return 0;
+    }
+
+    for (int seg = 1; seg < cast(int)SegData.length; seg++)
+    {   seg_data* pseg = SegData[seg];
+        if (I64)
+        {
+            if (strncmp(machobj.section_64s[pseg.SDshtidx].sectname.ptr, sectname, 16) == 0 &&
+                strncmp(machobj.section_64s[pseg.SDshtidx].segname.ptr, segname, 16) == 0)
+                return seg;         // return existing segment
+        }
+        else
+        {
+            if (strncmp(machobj.sections[pseg.SDshtidx].sectname.ptr, sectname, 16) == 0 &&
+                strncmp(machobj.sections[pseg.SDshtidx].segname.ptr, segname, 16) == 0)
+                return seg;         // return existing segment
+        }
+    }
+
+    const int seg = cast(int)SegData.length;
+    seg_data** ppseg = SegData.push();
+
+    seg_data* pseg = *ppseg;
+
+    if (pseg)
+    {
+         // recycle memory used
+         pseg.relocations.reset();
+         auto save = pseg.relocations;
+         OutBuffer* b1 = pseg.SDbuf;
+         memset(pseg, 0, seg_data.sizeof);
+         if (b1)
+             b1.reset();
+         pseg.relocations = save;
+         pseg.SDbuf = b1;
+    }
+    else
+    {
+        pseg = cast(seg_data*)mem_calloc(seg_data.sizeof);
+        SegData[seg] = pseg;
+    }
+
+    if (!pseg.SDbuf)
+    {
+        if (flags != S_ZEROFILL && flags != S_THREAD_LOCAL_ZEROFILL)
+        {
+            pseg.SDbuf = cast(OutBuffer*) calloc(1, OutBuffer.sizeof);
+            if (!pseg.SDbuf)
+                err_nomem();
+            pseg.SDbuf.reserve(4096);
+        }
+    }
+
+    //printf("\tNew segment - %d size %d\n", seg,SegData[seg].SDbuf);
+
+    pseg.SDseg = seg;
+    pseg.SDoffset = 0;
+
+    if (I64)
+    {
+        section_64* sec = machobj.section_64s.push();
+        strncpy(sec.sectname.ptr, sectname, 16);
+        strncpy(sec.segname.ptr, segname, 16);
+        sec._align = p2align;
+        sec.flags = flags;
+    }
+    else
+    {
+        section* sec = machobj.sections.push();
+        strncpy(sec.sectname.ptr, sectname, 16);
+        strncpy(sec.segname.ptr, segname, 16);
+        sec._align = p2align;
+        sec.flags = flags;
+    }
+
+    pseg.SDshtidx = ++machobj.section_length;
+    pseg.SDaranges_offset = 0;
+    pseg.SDlinnum_data.reset();
+
+    //printf("SegData.length = %zd, seg: %d relocations: %zd\n", SegData.length, seg, pseg.relocations.length);
+    return seg;
+}
+
+/********************************
+ * Memoize seg index.
+ * Params:
+ *      seg = value to memoize if it is not already set
+ *      sectname = section name
+ *      segname = segment name
+ *      p2align = section alignment as power of 2
+ *      flags = S_????
+ * Returns:
+ *      seg index
+ */
+int getsegment2(ref int seg, const(char)* sectname, const(char)* segname,
+        int p2align, int flags)
+{
+    if (seg == UNKNOWN)
+        seg = MachObj_getsegment(sectname, segname, p2align, flags);
+    return seg;
+}
+
+/**********************************
+ * Reset code seg to existing seg.
+ * Used after a COMDAT for a function is done.
+ */
+@trusted
+void MachObj_setcodeseg(int seg)
+{
+    cseg = seg;
+}
+
+/********************************
+ * Define a new code segment.
+ * Input:
+ *      name            name of segment, if null then revert to default
+ *      suffix  0       use name as is
+ *              1       append "_TEXT" to name
+ * Output:
+ *      cseg            segment index of new current code segment
+ *      Offset(cseg)         starting offset in cseg
+ * Returns:
+ *      segment index of newly created code segment
+ */
+
+int MachObj_codeseg(const char* name,int suffix)
+{
+    //dbg_printf("MachObj_codeseg(%s,%x)\n",name,suffix);
+    return 0;
+}
+
+/*********************************
+ * Define segments for Thread Local Storage for 32bit.
+ * Output:
+ *      machobj.seg_tlsseg      set to segment number for TLS segment.
+ * Returns:
+ *      segment for TLS segment
+ */
+@trusted
+seg_data* MachObj_tlsseg()
+{
+    //printf("MachObj_tlsseg()\n");
+    int seg = I32 ? getsegment2(machobj.seg_tlsseg, "__tls_data", "__DATA", 2, S_REGULAR)
+                  : getsegment2(machobj.seg_tlsseg, "__thread_vars", "__DATA", 3, S_THREAD_LOCAL_VARIABLES);
+    return SegData[seg];
+}
+
+/*******************************************
+ * Emit 24 byte __thread_vars section for AArch64.
+ * Params:
+ *      s = Symbol for variable to be added to __thread_vars section
+ *      offset = set to offset to start of where to write initializer data
+ *      bss = true to write to __thread_bss, false to __thread_data
+ * Returns:
+ *      segment to write initialization data to
+ */
+@trusted
+int MachObj_thread_vars(ref Symbol s, out targ_size_t offset, bool bss)
+{
+    //printf("MachObj_thread_vars(s: %s)\n", s.Sident.ptr);
+    //symbol_print(s);
+
+    /* create _ident$tlv$init Symbol tlvInitName
+     */
+    Symbol* si;
+    {
+        char[DEST_LEN] dest = void;
+        size_t len = strlen(s.Sident.ptr);
+        char* destr = dest.ptr;
+        if (len > DEST_LEN)
+            destr = cast(char*)mem_malloc(len + 1);
+        destr[0] = '_';
+        memcpy(destr + 1, s.Sident.ptr, len);
+        memcpy(destr + 1 + len, "$tlv$init".ptr, 9); // includes terminating 0
+        si = symbol_name(destr[0 .. 1 + len + 9], SC.locstat, type_fake(TYint));
+
+        if (destr != dest.ptr)
+            mem_free(dest.ptr);
+    }
+
+    /* write _ident$tlv$init to __thread_bss / __thread_data section
+     */
+    if (bss)
+    {
+        MachObj_tlsseg_bss();
+        si.Sseg = machobj.seg_tlsseg_bss;
+    }
+    else
+    {
+        MachObj_tlsseg_data();
+        si.Sseg = machobj.seg_tlsseg_data;
+    }
+    si.Sfl = FL.tlsdata;
+    MachObj_data_start(si, 0,si.Sseg);
+    offset = SegData[si.Sseg].SDoffset;
+    MachObj_pubdef(si.Sseg, si, offset);
+
+    /* Create __thread_vars section, and s will refer to it
+     */
+    seg_data* tvsegdata = MachObj_tlsseg(); // __thread_vars segment
+    int tvseg = machobj.seg_tlsseg;
+    s.Sseg = tvseg;
+    MachObj_pubdef(tvseg, &s, tvsegdata.SDbuf.length());
+
+    /* 3 pointers are written to __thread_vars section:
+     * 1. pointer to __tlv_bootstrap
+     * 2. null pointer
+     * 3. pointer to _ident$tlv$init in the __thread_data section
+     */
+
+    // 1. pointer to __tlv_bootstrap
+    Symbol* stlv_bootstrap = MachObj_tlv_bootstrap();
+    MachObj_reftoident(tvseg, tvsegdata.SDbuf.length(), stlv_bootstrap, 0, CF.off | CF.offset64);
+
+    // 2. null pointer
+    MachObj_write_zeros(tvsegdata, 8);
+
+    // 3. pointer to _ident$tlv$init in the __thread_data section
+    MachObj_reftoident(tvseg, tvsegdata.SDbuf.length(), si, 0, CF.off | CF.offset64);
+
+    assert((tvsegdata.SDbuf.length() % 24) == 0);
+    return si.Sseg;
+}
+
+/*********************************
+ * Define segments for Thread Local Storage.
+ * Output:
+ *      machobj.seg_tlsseg_bss  set to segment number for TLS segment.
+ * Returns:
+ *      segment for TLS segment
+ */
+@trusted
+seg_data* MachObj_tlsseg_bss()
+{
+
+    if (I32)
+    {
+        /* Because DMD does not support native tls for Mach-O 32bit,
+         * it's easier to support if we have all the tls in one segment.
+         */
+        return MachObj_tlsseg();
+    }
+    else
+    {
+        // The alignment should actually be alignment of the largest variable in
+        // the section, but this seems to work anyway.
+        int seg = getsegment2(machobj.seg_tlsseg_bss, "__thread_bss", "__DATA", 3, S_THREAD_LOCAL_ZEROFILL);
+        return SegData[seg];
+    }
+}
+
+/*********************************
+ * Define segments for Thread Local Storage data.
+ * Output:
+ *      machobj.seg_tlsseg_data    set to segment number for TLS data segment.
+ * Returns:
+ *      segment for TLS data segment
+ */
+@trusted
+seg_data* MachObj_tlsseg_data()
+{
+    //printf("MachObj_tlsseg_data(\n");
+    assert(I64);
+
+    // The alignment should actually be alignment of the largest variable in
+    // the section, but this seems to work anyway.
+    int seg = getsegment2(machobj.seg_tlsseg_data, "__thread_data", "__DATA", 4, S_THREAD_LOCAL_REGULAR);
+    return SegData[seg];
+}
+
+/*******************************
+ * Output an alias definition record.
+ */
+
+void MachObj_alias(const(char)* n1,const(char)* n2)
+{
+    //printf("MachObj_alias(%s,%s)\n",n1,n2);
+    assert(0);
+}
+
+
+/*******************************
+ * Mangle a name.
+ * Returns:
+ *      mangled name
+ */
+
+@trusted
+private
+char* obj_mangle2(Symbol* s,char* dest)
+{
+    size_t len;
+    const(char)* name;
+
+    //printf("MachObj_mangle(s = %p, '%s'), mangle = x%x\n",s,s.Sident.ptr,type_mangle(s.Stype));
+    symbol_debug(s);
+    assert(dest);
+    // C++ name mangling is handled by front end
+    name = &s.Sident[0];
+    len = strlen(name);                 // # of bytes in name
+    //dbg_printf("len %d\n",len);
+    switch (type_mangle(s.Stype))
+    {
+        case Mangle.pascal:             // if upper case
+        case Mangle.fortran:
+            if (len >= DEST_LEN)
+                dest = cast(char*)mem_malloc(len + 1);
+            memcpy(dest,name,len + 1);  // copy in name and ending 0
+            for (char* p = dest; *p; p++)
+                *p = cast(char)toupper(*p);
+            break;
+        case Mangle.stdcall:
+        {
+            bool cond = (tyfunc(s.ty()) && !variadic(s.Stype));
+            if (cond)
+            {
+                char[64] buffer = void;
+                int n = snprintf(buffer.ptr, buffer.length, "%u", type_paramsize(s.Stype));
+                assert(n < buffer.length);
+                size_t destlen = len + 1 + n + 1; // n does not include terminating 0
+                if (destlen > DEST_LEN)
+                    dest = cast(char*)mem_malloc(destlen);
+                memcpy(dest,name,len);
+                dest[len] = '@';
+                memcpy(dest + len + 1, buffer.ptr, n + 1);
+                break;
+            }
+            goto case;
+        }
+        case Mangle.syscall:
+        case 0:
+            if (len >= DEST_LEN)
+                dest = cast(char*)mem_malloc(len + 1);
+            memcpy(dest,name,len+1);// copy in name and trailing 0
+            break;
+
+        case Mangle.c:
+            if (s.Sflags & SFLnounderscore)
+                goto case 0;
+            goto case;
+        case Mangle.cpp:
+        case Mangle.d:
+            if (len >= DEST_LEN - 1)
+                dest = cast(char*)mem_malloc(1 + len + 1);
+            dest[0] = '_';
+            memcpy(dest + 1,name,len+1);// copy in name and trailing 0
+            break;
+
+
+        default:
+debug
+{
+            printf("mangling %x\n",type_mangle(s.Stype));
+            symbol_print(*s);
+}
+            printf("%d\n", type_mangle(s.Stype));
+            assert(0);
+    }
+    //dbg_printf("\t %s\n",dest);
+    return dest;
+}
+
+/*******************************
+ * Export a function name.
+ */
+
+void MachObj_export_symbol(Symbol* s,uint argsize)
+{
+    //dbg_printf("MachObj_export_symbol(%s,%d)\n",s.Sident.ptr,argsize);
+}
+
+/*******************************
+ * Update data information about symbol
+ *      align for output and assign segment
+ *      if not already specified.
+ *
+ * Input:
+ *      sdata           data symbol
+ *      datasize        output size
+ *      seg             default seg if not known
+ * Returns:
+ *      actual seg
+ */
+@trusted
+int MachObj_data_start(Symbol* sdata, targ_size_t datasize, int seg)
+{
+    size_t alignbytes;
+
+    //printf("MachObj_data_start(%s,size %llu,seg %d)\n",sdata.Sident.ptr,datasize,seg);
+    //symbol_print(sdata);
+
+    assert(sdata.Sseg);
+    if (sdata.Sseg == UNKNOWN) // if we don't know then there
+        sdata.Sseg = seg;      // wasn't any segment override
+    else
+        seg = sdata.Sseg;
+    targ_size_t offset = SegData[seg].SDoffset;
+    if (sdata.Salignment > 0)
+    {   if (SegData[seg].SDalignment < sdata.Salignment)
+            SegData[seg].SDalignment = sdata.Salignment;
+        alignbytes = cast(size_t)(((offset + sdata.Salignment - 1) & ~(sdata.Salignment - 1)) - offset);
+    }
+    else
+        alignbytes = cast(size_t)(_align(datasize, offset) - offset);
+    if (alignbytes)
+        MachObj_lidata(seg, offset, alignbytes);
+    sdata.Soffset = offset + alignbytes;
+    return seg;
+}
+
+/*******************************
+ * Update function info before codgen
+ *
+ * If code for this function is in a different segment
+ * than the current default in cseg, switch cseg to new segment.
+ */
+@trusted
+void MachObj_func_start(Symbol* sfunc)
+{
+    //printf("MachObj_func_start(%s)\n",sfunc.Sident.ptr);
+    symbol_debug(sfunc);
+
+    assert(sfunc.Sseg);
+    if (sfunc.Sseg == UNKNOWN)
+        sfunc.Sseg = CODE;
+    //printf("sfunc.Sseg %d CODE %d cseg %d Coffset x%x\n",sfunc.Sseg,CODE,cseg,SegData[cseg].SDoffset);
+    cseg = sfunc.Sseg;
+    assert(cseg == CODE || cseg > UDATA);
+    MachObj_pubdef(cseg, sfunc, SegData[cseg].SDoffset);
+    sfunc.Soffset = SegData[cseg].SDoffset;
+
+    dwarf_func_start(sfunc);
+}
+
+/*******************************
+ * Update function info after codgen
+ */
+@trusted
+void MachObj_func_term(Symbol* sfunc)
+{
+    //dbg_printf("MachObj_func_term(%s) offset %x, Coffset %x symidx %d\n",
+    //           sfunc.Sident.ptr, sfunc.Soffset,SegData[cseg].SDoffset,sfunc.Sxtrnnum);
+    dwarf_func_term(sfunc);
+}
+
+/********************************
+ * Output a public definition.
+ * Input:
+ *      seg =           segment index that symbol is defined in
+ *      s .            symbol
+ *      offset =        offset of name within segment
+ */
+
+void MachObj_pubdefsize(int seg, Symbol* s, targ_size_t offset, targ_size_t symsize)
+{
+    return MachObj_pubdef(seg, s, offset);
+}
+
+@trusted
+void MachObj_pubdef(int seg, Symbol* s, targ_size_t offset)
+{
+    //printf("MachObj_pubdef(%d:x%llx s=%p, %s)\n", seg, offset, s, s.Sident.ptr);
+    //symbol_print(*s);
+    symbol_debug(s);
+
+    s.Soffset = offset;
+    s.Sseg = seg;
+    static if (0)
+    if (strcmp(s.Sident.ptr, "_D3std11parallelism8TaskPool7__ClassZ") == 0)
+    {
+        fprintf(stdout, "pubdef symbol %p '%s'\n ", s, s.Sident.ptr);
+        fprintf(stdout, " Sclass = SC.%s ", class_str(s.Sclass));
+        fprintf(stdout, " Ssymnum = %d",cast(int)s.Ssymnum);
+        fprintf(stdout, " Sxtrnnum = %d",cast(int)s.Sxtrnnum);
+        fprintf(stdout, " Sfl = %s\n\n", fl_str(cast(FL) s.Sfl));
+    }
+    switch (s.Sclass)
+    {
+        case SC.global:
+        case SC.inline:
+            machobj.publicSymbols.push(s);
+            break;
+        case SC.comdat:
+        case SC.comdef:
+            machobj.publicSymbols.push(s);
+            break;
+        case SC.static_:
+            if (s.Sflags & SFLhidden)
+            {
+                machobj.publicSymbols.push(s);
+                break;
+            }
+            goto default;
+        case SC.extern_:
+            // should probably fix whoever is sending an SC.extern_ here
+            MachObj_external(s);
+            break;
+
+        default:
+            //printf("Writing to local symbols: %s\n", s.Sident.ptr);
+            machobj.localSymbols.push(s);
+            break;
+    }
+    //printf("%p\n", *cast(void**)machobj.publicSymbols.buf);
+    s.Sxtrnnum = 1;
+}
+
+/*******************************
+ * Output an external symbol for name.
+ * Input:
+ *      name    Name to do EXTDEF on
+ *              (Not to be mangled)
+ * Returns:
+ *      Symbol table index of the definition
+ *      NOTE: Numbers will not be linear.
+ */
+
+@trusted
+int MachObj_external_def(const(char)* name)
+{
+    //printf("MachObj_external_def('%s')\n",name);
+    assert(name);
+    assert(machobj.extdef == 0);
+    machobj.extdef = MachObj_addstr(machobj.symtab_strings, name);
+    return 0;
+}
+
+
+/*******************************
+ * Output an external for existing symbol.
+ * Input:
+ *      s       Symbol to do EXTDEF on
+ *              (Name is to be mangled)
+ * Returns:
+ *      Symbol table index of the definition
+ *      NOTE: Numbers will not be linear.
+ */
+
+@trusted
+int MachObj_external(Symbol* s)
+{
+    //printf("MachObj_external('%s') %p\n",s.Sident.ptr,s.Svalue);
+    symbol_debug(s);
+    machobj.externSymbols.push(s);
+    s.Sxtrnnum = 1;
+    return 0;
+}
+
+/*******************************
+ * Output a common block definition.
+ * Input:
+ *      p .    external identifier
+ *      size    size in bytes of each elem
+ *      count   number of elems
+ * Returns:
+ *      Symbol table index for symbol
+ */
+@trusted
+int MachObj_common_block(Symbol* s,targ_size_t size,targ_size_t count)
+{
+    //printf("MachObj_common_block('%s', size=%lld, count=%lld)\n",s.Sident.ptr,size,count);
+    symbol_debug(s);
+
+    // can't have code or thread local comdef's
+    assert(!(s.ty() & (mTYcs | mTYthread)));
+    // support for hidden comdefs not implemented
+    assert(!(s.Sflags & SFLhidden));
+
+    Comdef comdef = void;
+    comdef.sym = s;
+    comdef.size = size;
+    comdef.count = cast(int)count;
+    machobj.comdefs.push(comdef);
+    s.Sxtrnnum = 1;
+    if (!s.Sseg)
+        s.Sseg = UDATA;
+    return 0;           // should return void
+}
+
+int MachObj_common_block(Symbol* s, int flag, targ_size_t size, targ_size_t count)
+{
+    return MachObj_common_block(s, size, count);
+}
+
+/***************************************
+ * Append an iterated data block of 0s.
+ * (uninitialized data only)
+ */
+
+void MachObj_write_zeros(seg_data* pseg, targ_size_t count)
+{
+    MachObj_lidata(pseg.SDseg, pseg.SDoffset, cast(size_t)count);
+}
+
+/***************************************
+ * Output an iterated data block of 0s.
+ *
+ *      For boundary alignment and initialization
+ */
+@trusted
+void MachObj_lidata(int seg,targ_size_t offset, size_t count)
+{
+    //printf("MachObj_lidata(seg: %d, offset: %x, count: %d)\n", seg, cast(int)offset, cast(int)count);
+    size_t idx = SegData[seg].SDshtidx;
+
+    const flags = (I64 ? machobj.section_64s[idx].flags : machobj.sections[idx].flags);
+    if (flags == S_ZEROFILL || flags == S_THREAD_LOCAL_ZEROFILL)
+    {   // Use SDoffset to record size of bss section
+        SegData[seg].SDoffset += count;
+        //printf("MachObj_lidata(seg: %d, offset: x%x, count: x%x)\n", seg, cast(int)offset, cast(int)count);
+        //printf("SDoffset: x%x\n", cast(int)SegData[seg].SDoffset);
+    }
+    else
+    {
+        void* p = null;
+        MachObj_bytes(seg, offset, p[0 .. count]);
+    }
+}
+
+/***********************************
+ * Append byte to segment.
+ */
+
+void MachObj_write_byte(seg_data* pseg, uint byte_)
+{
+    MachObj_byte(pseg.SDseg, pseg.SDoffset, byte_);
+}
+
+/************************************
+ * Output byte to object file.
+ */
+@trusted
+void MachObj_byte(int seg,targ_size_t offset,uint byte_)
+{
+    OutBuffer* buf = SegData[seg].SDbuf;
+    int save = cast(int)buf.length();
+    //dbg_printf("MachObj_byte(seg=%d, offset=x%lx, byte_=x%x)\n",seg,offset,byte_);
+    buf.setsize(cast(uint)offset);
+    buf.writeByte(cast(ubyte)byte_);
+    if (save > offset+1)
+        buf.setsize(save);
+    else
+        SegData[seg].SDoffset = offset+1;
+    //dbg_printf("\tsize now %d\n",buf.length());
+}
+
+/***********************************
+ * Append bytes to segment.
+ */
+
+void MachObj_write_bytes(seg_data* pseg, const(void)[] data)
+{
+    MachObj_bytes(pseg.SDseg, pseg.SDoffset, data);
+}
+
+/************************************
+ * Output bytes to object file.
+ * Returns:
+ *      data.length
+ */
+@trusted
+size_t MachObj_bytes(int seg, targ_size_t offset, const(void)[] data)
+{
+    //printf("MachObj_bytes(seg: %d offset: %02zx nbytes: %02zx p: %p)\n", seg, offset, data.length, data.ptr);
+    if (0 && seg == 1)
+        dumpBytes(offset, data);
+
+    if (log)
+    {
+        if (!(seg >= 0 && seg < SegData.length))
+        {
+            debug printf("MachObj_bytes: seg = %d, SegData.length = %llu\n", seg, cast(ulong)SegData.length);
+            *cast(char*)0=0;
+        }
+    }
+    const nbytes = data.length;
+    auto p = data.ptr;
+    assert(seg >= 0 && seg < SegData.length);
+    OutBuffer* buf = SegData[seg].SDbuf;
+    if (buf == null)
+    {
+        //dbg_printf("MachObj_bytes(seg=%d, offset=x%llx, nbytes=%d, p=%p)\n", seg, offset, nbytes, p);
+        //raise(SIGSEGV);
+        assert(buf != null);
+    }
+    const save = buf.length();
+    //dbg_printf("MachObj_bytes(seg=%d, offset=x%lx, nbytes=%d, p=x%x)\n",
+            //seg,offset,nbytes,p);
+
+    /* Hacky thing: addtofixlist() calls this function, and writes 0,0,0,0 into the buffer at the location
+     * of the fixup. This can overwrite the existing bytes which contain AArch64 instructions, zeroing them out.
+     * The hacky thing is to not overwrite them
+     */
+    if (save >= offset + nbytes && nbytes == 4)  // if overwriting, and instructions for AArch64 are 4 bytes
+    {
+        // Overwriting, so don't overwrite a non-zero existing value
+        ubyte* pb = buf.buf() + offset;
+        //printf("existing value: %02zx: %08x\n", offset, *cast(int*)pb);
+        //printf("new      value: %02zx: %08x\n", offset, *cast(int*)p);
+        if (pb[0] || pb[1] || pb[2] || pb[3])
+        {
+            //printf("not overwriting %zx .. %zx\n", offset, offset + nbytes);
+            return nbytes;
+        }
+    }
+
+    buf.position(cast(size_t)offset, nbytes);
+    if (p)
+    {
+        buf.write(p, nbytes);
+    }
+    else // Zero out the bytes
+        buf.writezeros(nbytes);
+
+    static if (0) if (seg == 1)
+    {
+        printf("after\n");
+        dumpBytes(offset, nbytes, buf.buf() + offset);
+    }
+
+    if (save > offset+nbytes)
+        buf.setsize(save);
+    else
+        SegData[seg].SDoffset = offset+nbytes;
+    return nbytes;
+}
+
+/*********************************************
+ * Add a relocation entry for seg/offset.
+ */
+@trusted
+void MachObj_addrel(int seg, targ_size_t offset, Symbol* targsym,
+        uint targseg, REL rtype, int val = 0)
+{
+    //printf("MachObj_addrel() %s\n", targsym.Sident.ptr);
+    Relocation rel = void;
+    rel.offset = offset;
+    rel.targsym = targsym;
+    rel.targseg = targseg;
+    rel.rtype = rtype;
+    rel.subtractor = false;
+    rel.funcsym = funcsym_p;
+    rel.val = cast(short)val;
+
+    seg_data* pseg = SegData[seg];
+    if (machobj.AArch64 && targsym && targsym.Sxtrnnum == 0)
+        MachObj_external(targsym);
+
+    pseg.relocations.push(rel);
+}
+
+/*******************************
+ * Refer to address that is in the data segment.
+ * Input:
+ *      seg:offset =    the address being fixed up
+ *      val =           displacement from start of target segment
+ *      targetdatum =   target segment number (DATA, CDATA or UDATA, etc.)
+ *      flags =         CF.off, CF.seg
+ * Example:
+ *      int* abc = &def[3];
+ *      to allocate storage:
+ *              MachObj_reftodatseg(DATA,offset,3 * (int *).sizeof,UDATA);
+ */
+@trusted
+void MachObj_reftodatseg(int seg,targ_size_t offset,targ_size_t val,
+        uint targetdatum,int flags)
+{
+    OutBuffer* buf = SegData[seg].SDbuf;
+    int save = cast(int)buf.length();
+    buf.setsize(cast(uint)offset);
+    if (log)
+        debug printf("MachObj_reftodatseg(seg:offset=%d:x%llx, val=x%llx, targetdatum %x, flags %x )\n",
+                     seg,offset,val,targetdatum,flags);
+    assert(seg != 0);
+    if (SegData[seg].isCode() && SegData[targetdatum].isCode())
+    {
+        assert(0);
+    }
+    MachObj_addrel(seg, offset, null, targetdatum, REL.address);
+    if (I64)
+    {
+        if (flags & CF.offset64)
+        {
+            buf.write64(val);
+            if (save > offset + 8)
+                buf.setsize(save);
+            return;
+        }
+    }
+    buf.write32(cast(int)val);
+    if (save > offset + 4)
+        buf.setsize(save);
+}
+
+/*******************************
+ * Refer to address that is in the current function code (funcsym_p).
+ * Only offsets are output, regardless of the memory model.
+ * Used to put values in switch address tables.
+ * Input:
+ *      seg =           where the address is going (CODE or DATA)
+ *      offset =        offset within seg
+ *      val =           displacement from start of this module
+ */
+@trusted
+void MachObj_reftocodeseg(int seg,targ_size_t offset,targ_size_t val)
+{
+    //printf("MachObj_reftocodeseg(seg=%d, offset=x%x, val=x%x )\n",seg,cast(uint)offset,cast(uint)val);
+    assert(seg > 0);
+    OutBuffer* buf = SegData[seg].SDbuf;
+    int save = cast(int)buf.length();
+    buf.setsize(cast(uint)offset);
+    val -= funcsym_p.Soffset;
+    MachObj_addrel(seg, offset, funcsym_p, 0, REL.address);
+//    if (I64)
+//        buf.write64(val);
+//    else
+        buf.write32(cast(int)val);
+    if (save > offset + 4)
+        buf.setsize(save);
+}
+
+/*******************************
+ * Refer to an identifier.
+ * Input:
+ *      seg =   where the address is going (CODE or DATA)
+ *      offset =        offset within seg
+ *      s .            Symbol table entry for identifier
+ *      val =           displacement from identifier
+ *      flags =         CF.selfrel: self-relative
+ *                      CF.seg: get segment
+ *                      CF.off: get offset
+ *                      CF.pc32: [RIP] addressing, val is 0, -1, -2 or -4
+ *                      CF.offset64: 8 byte offset for 64 bit builds
+ *                      CF.selfrel26: 26 bit offset for BL function calls
+ * Returns:
+ *      number of bytes in reference (4 or 8)
+ */
+@trusted
+int MachObj_reftoident(int seg, targ_size_t offset, Symbol* s, targ_size_t val,
+        int flags)
+{
+    if (machobj.AArch64)
+        return MachObj_reftoidentAArch64(seg, offset, s, val, flags);
+
+    int retsize = (flags & CF.offset64) ? 8 : 4;
+    if (log)
+    {
+        debug printf("\nMachObj_reftoident('%s' seg %d, offset x%llx, val x%llx, flags x%x) ",
+                     s.Sident.ptr,seg,cast(ulong)offset,cast(ulong)val,flags);
+        CF_print(flags);
+        debug printf("retsize = %d\n", retsize);
+        //dbg_printf("Sseg = %d, Sxtrnnum = %d\n",s.Sseg,s.Sxtrnnum);
+        symbol_print(*s);
+    }
+    assert(seg > 0);
+    if (s.Sclass != SC.locstat && !s.Sxtrnnum)
+    {   // It may get defined later as public or local, so defer
+        size_t numbyteswritten = addtofixlist(s, offset, seg, val, flags);
+        assert(numbyteswritten == retsize);
+    }
+    else
+    {
+        if (I64)
+        {
+            //if (s.Sclass != SCcomdat)
+                //val += s.Soffset;
+            int v = 0;
+            if (flags & CF.pc32)
+                v = cast(int)val;
+            if (flags & CF.selfrel)
+            {
+                MachObj_addrel(seg, offset, s, 0, REL.rel, v);
+            }
+            else
+            {
+                MachObj_addrel(seg, offset, s, 0, REL.address, v);
+            }
+        }
+        else
+        {
+            if (SegData[seg].isCode() && flags & CF.selfrel)
+            {
+                if (!machobj.jumpTableSeg)
+                {
+                    machobj.jumpTableSeg =
+                        MachObj_getsegment("__jump_table", "__IMPORT",  0, S_SYMBOL_STUBS | S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS | S_ATTR_SELF_MODIFYING_CODE);
+                }
+                seg_data* pseg = SegData[machobj.jumpTableSeg];
+                if (I64)
+                    machobj.section_64s[pseg.SDshtidx].reserved2 = 5;
+                else
+                    machobj.sections[pseg.SDshtidx].reserved2 = 5;
+
+                // Look through indirectsym to see if it is already there
+                foreach (i, psym; machobj.indirectSymbols1[])
+                {   // Linear search, pretty pathetic
+                    if (s == psym)
+                    {   val = cast(int)i * 5;
+                        goto L1;
+                    }
+                }
+
+                val = pseg.SDbuf.length();
+                static immutable char[5] halts = [ 0xF4,0xF4,0xF4,0xF4,0xF4 ];
+                pseg.SDbuf.write(halts.ptr, 5);
+
+                // Add symbol s to machobj.indirectSymbols1
+                machobj.indirectSymbols1.push(s);
+             L1:
+                val -= offset + 4;
+                MachObj_addrel(seg, offset, null, machobj.jumpTableSeg, REL.rel);
+            }
+            else if (SegData[seg].isCode() &&
+                     !(flags & CF.indirect) &&
+                    ((s.Sclass != SC.extern_ && SegData[s.Sseg].isCode()) || s.Sclass == SC.locstat ||
+                     s.Sclass == SC.static_))
+            {
+                val += s.Soffset;
+                MachObj_addrel(seg, offset, null, s.Sseg, REL.address);
+            }
+            else if ((flags & CF.indirect) ||
+                     SegData[seg].isCode() && !tyfunc(s.ty()))
+            {
+                if (!machobj.pointersSeg)
+                {
+                    machobj.pointersSeg =
+                        MachObj_getsegment("__pointers", "__IMPORT",  0, S_NON_LAZY_SYMBOL_POINTERS);
+                }
+                seg_data* pseg = SegData[machobj.pointersSeg];
+
+                // Look through indirectsym to see if it is already there
+                foreach (i, psym; machobj.indirectSymbols2[])
+                {   // Linear search, pretty pathetic
+                    if (s == psym)
+                    {   val = cast(int)i * 4;
+                        goto L2;
+                    }
+                }
+
+                val = pseg.SDbuf.length();
+                pseg.SDbuf.writezeros(_tysize[TYnptr]);
+
+                // Add symbol s to indirectSymbols2
+                machobj.indirectSymbols2.push(s);
+
+             L2:
+                //printf("MachObj_reftoident: seg = %d, offset = x%x, s = %s, val = x%x, pointersSeg = %d\n", seg, cast(int)offset, s.Sident.ptr, cast(int)val, machobj.pointersSeg);
+                if (flags & CF.indirect)
+                {
+                    Relocation rel = void;
+                    rel.offset = offset;
+                    rel.targsym = null;
+                    rel.targseg = machobj.pointersSeg;
+                    rel.rtype = REL.address;
+                    rel.subtractor = false;
+                    rel.funcsym = null;
+                    rel.val = 0;
+
+                    seg_data* pseg2 = SegData[seg];
+                    pseg2.relocations.push(rel);
+                }
+                else
+                    MachObj_addrel(seg, offset, null, machobj.pointersSeg, REL.address);
+            }
+            else
+            {   //val -= s.Soffset;
+                MachObj_addrel(seg, offset, s, 0, REL.address);
+            }
+        }
+
+        OutBuffer* buf = SegData[seg].SDbuf;
+        int save = cast(int)buf.length();
+        buf.position(cast(size_t)offset, retsize);
+        //printf("offset = x%llx, val = x%llx\n", offset, val);
+        if (retsize == 8)
+            buf.write64(val);
+        else
+            buf.write32(cast(int)val);
+        if (save > offset + retsize)
+            buf.setsize(save);
+    }
+    return retsize;
+}
+
+@trusted
+int MachObj_reftoidentAArch64(int seg, targ_size_t offset, Symbol* s, targ_size_t val,
+        int flags)
+{
+    int retsize = (flags & CF.offset64) ? 8 : 4;
+    if (log)
+    {
+        debug printf("\nMachObj_reftoidentAArch64('%s' seg %d, offset x%llx, val x%llx, flags x%x) ",
+                     s.Sident.ptr,seg,offset,val,flags);
+        //CF_print(flags);
+        //debug printf("retsize = %d\n", retsize);
+        //dbg_printf("Sseg = %d, Sxtrnnum = %d\n",s.Sseg,s.Sxtrnnum);
+        //symbol_print(*s);
+    }
+    assert(seg > 0);
+    if (s.Sclass != SC.locstat && !s.Sxtrnnum)
+    {   // It may get defined later as public or local, so defer
+        size_t numbyteswritten = addtofixlist(s, offset, seg, val, flags);
+        assert(numbyteswritten == retsize);
+    }
+    else
+    {
+        //if (s.Sclass != SCcomdat)
+            //val += s.Soffset;
+        int v = 0;
+        if (flags & CF.pc32)
+            v = cast(int)val;
+        if (flags & CF.selfrel26)
+        {
+            MachObj_addrel(seg, offset, s, 0, REL.rel26, v);
+        }
+        else if (flags & CF.selfrel)
+        {
+            MachObj_addrel(seg, offset, s, 0, REL.rel, v);
+        }
+        else if (flags & CF.add)
+        {
+            MachObj_addrel(seg, offset, s, 0, REL.add, v);
+        }
+        else
+        {
+            MachObj_addrel(seg, offset, s, 0, REL.address, v);
+        }
+    }
+
+    OutBuffer* buf = SegData[seg].SDbuf;
+    int save = cast(int)buf.length();
+    buf.position(cast(size_t)offset, retsize);
+    if (flags & CF.selfrel26 && val == 0)
+    {
+        //printf("offset = x%llx, val = x%llx\n", offset, val);
+    }
+    else if (retsize == 4)
+    {
+        if (offset + retsize <= save)
+        {
+            ubyte[] slice = buf.peekSlice();
+            uint* p = cast(uint*)(slice.ptr + offset);
+            if (!*p)            // don't step on PAGEOFF12, PAGE21, and BRANCHY26 instructions
+                buf.write32(cast(int)val);
+        }
+        else
+            buf.write32(cast(int)val);
+    }
+    else
+        buf.write64(val);
+    if (save >= offset + retsize)
+        buf.setsize(save);
+
+    return retsize;
+}
+
+
+/*****************************************
+ * Generate far16 thunk.
+ * Input:
+ *      s       Symbol to generate a thunk for
+ */
+
+void MachObj_far16thunk(Symbol* s)
+{
+    //dbg_printf("MachObj_far16thunk('%s')\n", s.Sident.ptr);
+    assert(0);
+}
+
+/**************************************
+ * Mark object file as using floating point.
+ */
+
+void MachObj_fltused()
+{
+    //dbg_printf("MachObj_fltused()\n");
+}
+
+/************************************
+ * Close and delete .OBJ file.
+ */
+
+void machobjfile_delete()
+{
+    //remove(fobjname); // delete corrupt output file
+}
+
+/**********************************
+ * Terminate.
+ */
+
+void machobjfile_term()
+{
+static if(TERMCODE)
+{
+    mem_free(fobjname);
+    fobjname = null;
+}
+}
+
+/**********************************
+  * Write to the object file
+  */
+/+void objfile_write(FILE* fd, void* buffer, uint len)
+{
+    machobj.fobjbuf.write(buffer, len);
+}+/
+
+@trusted
+private int elf_align(targ_size_t size, int foffset)
+{
+    if (size <= 1)
+        return foffset;
+    int offset = cast(int)((foffset + size - 1) & ~(size - 1));
+    if (offset > foffset)
+        machobj.fobjbuf.writezeros(offset - foffset);
+    return offset;
+}
+
+/***************************************
+ * Stuff pointer to ModuleInfo in its own segment.
+ */
+@trusted
+void MachObj_moduleinfo(Symbol* scc)
+{
+    int p2align = I64 ? 3 : 2; // align to _tysize[TYnptr]
+
+    int seg = MachObj_getsegment("__minfodata", "__DATA", p2align, S_REGULAR);
+    //printf("MachObj_moduleinfo(%s) seg = %d:x%x\n", scc.Sident.ptr, seg, SegData[seg].SDoffset);
+
+    int flags = CF.off;
+    if (I64)
+        flags |= CF.offset64;
+    SegData[seg].SDoffset += MachObj_reftoident(seg, SegData[seg].SDoffset, scc, 0, flags);
+}
+
+/*************************************
+ */
+void MachObj_gotref(Symbol* s)
+{
+    //printf("MachObj_gotref(%x '%s', %d)\n",s,s.Sident.ptr, s.Sclass);
+    switch(s.Sclass)
+    {
+        case SC.static_:
+        case SC.locstat:
+            s.Sfl = FL.gotoff;
+            break;
+
+        case SC.extern_:
+        case SC.global:
+        case SC.comdat:
+        case SC.comdef:
+            s.Sfl = FL.got;
+            break;
+
+        default:
+            break;
+    }
+}
+
+/**
+ * Returns the symbol for the __tlv_bootstrap function.
+ *
+ * This function is used in the implementation of native thread local storage.
+ * It's used as a placeholder in the TLV descriptors. The dynamic linker will
+ * replace the placeholder with a real function at load time.
+ */
+@trusted
+Symbol* MachObj_tlv_bootstrap()
+{
+    if (!machobj.tlv_bootstrap_sym)
+        machobj.tlv_bootstrap_sym = symbol_name("__tlv_bootstrap", SC.extern_, type_fake(TYnfunc));
+    return machobj.tlv_bootstrap_sym;
+}
+
+
+void MachObj_write_pointerRef(Symbol* s, uint off)
+{
+}
+
+/******************************************
+ * Generate fixup specific to .eh_frame and .gcc_except_table sections.
+ * Params:
+ *      seg = segment of where to write fixup
+ *      offset = offset of where to write fixup
+ *      s = fixup is a reference to this Symbol
+ *      val = displacement from s
+ * Returns:
+ *      number of bytes written at seg:offset
+ */
+@trusted
+int mach_dwarf_reftoident(int seg, targ_size_t offset, Symbol* s, targ_size_t val)
+{
+    //printf("dwarf_reftoident(seg=%d offset=x%x s=%s val=x%x\n", seg, cast(int)offset, s.Sident.ptr, cast(int)val);
+    if (machobj.AArch64)
+        MachObj_reftoident(seg, offset, s, val, CF.selfrel);
+        //MachObj_reftoident(seg, offset, s, val + 4, CF.off);
+    else
+        MachObj_reftoident(seg, offset, s, val + 4, I64 ? CF.off : CF.indirect);
+    return 4;
+}
+
+/*****************************************
+ * Generate LSDA and PC_Begin fixups in the __eh_frame segment encoded as DW_EH_PE_pcrel|ptr.
+ * 64 bits
+ *   LSDA
+ *      [0] address x0071 symbolnum 6 pcrel 0 length 3 extern 1 type 5 RELOC_SUBTRACTOR __Z3foov.eh
+ *      [1] address x0071 symbolnum 1 pcrel 0 length 3 extern 1 type 0 RELOC_UNSIGNED   GCC_except_table2
+ *   PC_Begin:
+ *      [2] address x0060 symbolnum 6 pcrel 0 length 3 extern 1 type 5 RELOC_SUBTRACTOR __Z3foov.eh
+ *      [3] address x0060 symbolnum 5 pcrel 0 length 3 extern 1 type 0 RELOC_UNSIGNED   __Z3foov
+ *      Want the result to be  &s - pc
+ *      The fixup yields       &s - &fdesym + value
+ *      Therefore              value = &fdesym - pc
+ *      which is the same as   fdesym.Soffset - offset
+ * 32 bits
+ *   LSDA
+ *      [6] address x0028 pcrel 0 length 2 value x0 type 4 RELOC_LOCAL_SECTDIFF
+ *      [7] address x0000 pcrel 0 length 2 value x1dc type 1 RELOC_PAIR
+ *   PC_Begin
+ *      [8] address x0013 pcrel 0 length 2 value x228 type 4 RELOC_LOCAL_SECTDIFF
+ *      [9] address x0000 pcrel 0 length 2 value x1c7 type 1 RELOC_PAIR
+ * Params:
+ *      dfseg = segment of where to write fixup (eh_frame segment)
+ *      offset = offset of where to write fixup (eh_frame offset)
+ *      s = fixup is a reference to this Symbol (GCC_except_table%d or function_name)
+ *      val = displacement from s
+ *      fdesym = function_name.eh
+ * Returns:
+ *      number of bytes written at seg:offset
+ */
+@trusted
+int dwarf_eh_frame_fixup(int dfseg, targ_size_t offset, Symbol* s, targ_size_t val, Symbol* fdesym)
+{
+    //printf("dwarf_eh_frame_fixup() dfseg:%d, offset:x%zx, s:%s val:x%zx fdesym:%s\n", dfseg, offset, s.Sident.ptr, val, fdesym.Sident.ptr);
+    OutBuffer* buf = SegData[dfseg].SDbuf;
+    assert(offset == buf.length());
+    assert(fdesym.Sseg == dfseg);
+    if (I64)
+        buf.write64(val);  // add in 'value' later
+    else
+        buf.write32(cast(int)val);
+
+    Relocation rel;
+    rel.offset = offset;
+    rel.targsym = s;
+    rel.targseg = 0;
+
+static if (0)
+{
+    rel.rtype = machobj.AArch64 ? REL.rel : REL.address;
+    rel.subtractor = !machobj.AArch64;
+}
+else
+{
+    rel.rtype = REL.address;
+    rel.subtractor = 1;
+}
+
+    rel.funcsym = fdesym;
+    rel.val = 0;
+
+    seg_data* pseg = SegData[dfseg];
+    pseg.relocations.push(rel);
+
+    return I64 ? 8 : 4;
+}
+
+
+private:
+
+/**
+ * Encapsulates the build_version_command/version_min_command load commands.
+ *
+ * For the 10.14 and later SDK, the `build_version_command` load command is used.
+ * For earlier versions, the `version_min_command` load command is used.
+ */
+const struct VersionCommand
+{
+    pure:
+    nothrow:
+    @nogc:
+    @safe:
+
+    private
+    {
+        /**
+         * This is the absolute minimum supported version of macOS (64 bit) for DMD,
+         * as documented at: https://dlang.org/dmd-osx.html#requirements
+         * NOTE: Versions earlier than 10.7 do not support thread local storage.
+         */
+        enum fallbackOSVersion = Version(10, 9).encode;
+
+        /// The first minor version that uses the `build_version_command`.
+        enum firstMinorUsingBuildVersionCommand = 14;
+
+        /// `true` if the `build_version_command` load command should be used.
+        bool useBuild;
+
+        /// The `build_version_command` load command.
+        build_version_command buildVersionCommand;
+
+        /// The `version_min_command` load command.
+        version_min_command versionMinCommand;
+    }
+
+    /**
+     * Initializes the VersionCommand.
+     *
+     * Params:
+     *  os = the version of the operating system
+     */
+    this(Version os)
+    {
+        useBuild = os.minor >= firstMinorUsingBuildVersionCommand;
+
+        const encodedOs = os.isValid ? os.encode : fallbackOSVersion;
+
+        const build_version_command buildVersionCommand = { minos: encodedOs };
+        const version_min_command versionMinCommand = { version_: encodedOs };
+
+        this.buildVersionCommand = buildVersionCommand;
+        this.versionMinCommand = versionMinCommand;
+    }
+
+    /// Returns: the size of the load command.
+    size_t size()
+    {
+        return useBuild ? build_version_command.sizeof : version_min_command.sizeof;
+    }
+
+    /// Returns: the data for the load command.
+    const(void)* data() return
+    {
+        return useBuild ? cast(const(void)*) &buildVersionCommand : cast(const(void)*) &versionMinCommand;
+    }
+}
+
+/// Holds an operating system version or a SDK version.
+struct Version
+{
+    ///
+    int major;
+
+    ///
+    int minor;
+
+    ///
+    int build;
+
+    /// Returns: `true` if the version is valid
+    bool isValid() pure nothrow @nogc @safe inout
+    {
+        return major >= 10 && major < 100 &&
+            minor >= 0 && minor < 100 &&
+            build >= 0 && build < 100;
+    }
+}
+
+/**
+ * Returns the given version encoded as a single integer.
+ *
+ * Params:
+ *  version_ = the version to encode. Needs to be a valid version
+ *      (`version_.isValid`)
+ *
+ * Returns: the encoded version
+ */
+int encode(Version version_) pure @nogc @safe
+in
+{
+    assert(version_.isValid);
+}
+do
+{
+    with (version_)
+        return major * 2^^16 + minor * 2^^8 + build * 2^^0;
+}
+
+unittest
+{
+    assert(Version(10, 14, 0).encode == 0x0a0e00);
+    assert(Version(10, 14, 1).encode == 0x0a0e01);
+    assert(Version(10, 14, 6).encode == 0x0a0e06);
+    assert(Version(10, 14, 99).encode == 0x0a0e63);
+
+    assert(Version(10, 15, 6).encode == 0x0a0f06);
+
+    assert(Version(10, 16, 0).encode == 0x0a1000);
+    assert(Version(10, 16, 6).encode == 0x0a1006);
+
+    assert(Version(10, 17, 0).encode == 0x0a1100);
+}
+
+/// Returns: the version of the currently running operating system.
+@trusted
+Version operatingSystemVersion()
+{
+    if (const deploymentTarget = getenv("MACOSX_DEPLOYMENT_TARGET"))
+    {
+        const version_ = toVersion(deploymentTarget);
+
+        if (version_.isValid)
+            return version_;
+
+        error(Srcpos.init, "invalid version number in 'MACOSX_DEPLOYMENT_TARGET=%s'", deploymentTarget);
+    }
+    return Version();
+}
+
+/**
+ * Converts the given string to a `Version`.
+ *
+ * Params:
+ *  str = the string to convert. Should have the format `XX.YY(.ZZ)`. Needs to
+ *      be `\0` terminated.
+ *
+ * Returns: the converted `Version`.
+ */
+@trusted
+Version toVersion(const(char)* str) @nogc
+{
+    if (!str)
+        return Version();
+
+    const str_len = strlen(str);
+    if (str_len < 1)
+        return Version();
+
+    if (strspn(str, "0123456789.") != str_len)
+        return Version();
+
+    if (!isdigit(str[0]) || !isdigit(str[str_len - 1]))
+        return Version();
+
+    Version version_;
+    const(char)* endptr;
+
+    with (version_)
+    {
+        major = cast(int)strtoul(str, &endptr, 10);
+        str = endptr + ((*endptr == '.') ? 1 : 0);
+
+        if (*str == '.')
+            return Version();
+
+        minor = cast(int)strtoul(str, &endptr, 10);
+        str = endptr + ((*endptr == '.') ? 1 : 0);
+
+        build = cast(int)strtoul(str, &endptr, 10);
+        if (*endptr != '\0')
+            return Version();
+    }
+
+    return version_;
+}
+
+unittest
+{
+    assert(toVersion("10") == Version(10, 0, 0));
+    assert(toVersion("10.10") == Version(10, 10, 0));
+    assert(toVersion("10.10.1") == Version(10, 10, 1));
+    assert(toVersion("10.000010.1") == Version(10, 10, 1));
+    assert(toVersion("10.010.001") == Version(10, 10, 1));
+    assert(toVersion("000010.10.00001") == Version(10, 10, 1));
+    assert(toVersion(".9.1") == Version(0, 0, 0));
+    assert(toVersion("10..9") == Version(0, 0, 0));
+    assert(toVersion("10.10.") == Version(0, 0, 0));
+}
+
+/******************************
+ * Handy function to dump sections of buffers in hex.
+ * Params:
+ *      offset = starting address of data
+ *      nbytes = number of bytes to dump
+ *      p = pointer to the bytes to be dumped
+ */
+@trusted
+private
+void dumpBytes(targ_size_t offset, const(void)[] data)
+{
+    auto n = data.length;
+    auto p1 = data.ptr;
+    printf("dump: offset: %02llx nbytes: %02zx p: %p\n", offset, n, p1);
+
+    auto p2 = p1 + n;
+    auto off = offset;
+    while (p1 < p2)
+    {
+        printf("  %02llx: ", off);
+        if (n >= 4)
+        {
+            printf("%08x\n", *cast(int*)p1);
+            p1 += 4;
+            n -= 4;
+            off += 4;
+        }
+        else if (n >= 2)
+        {
+            printf("%04x\n", *cast(ushort*)p1);
+            p1 += 2;
+            n -= 2;
+            off += 2;
+        }
+        else
+        {
+            printf("%02x\n", *cast(ubyte*)p1);
+            p1 += 1;
+            n -= 1;
+            off += 1;
+        }
+    }
+}
+
+/********************************************
+ * Pretty print `fixup` for Symbol `s`
+ */
+private
+@trusted
+void dumpFixup(ref Symbol s, uint fixup)
+{
+    static immutable char*[12] reloc =
+    [
+        "UNSIGNED",
+        "SUBTRACTOR",
+        "BRANCHY26",
+        "PAGE21",
+        "PAGEOFF12",
+        "GOT_LOAD_PAGE21",
+        "GOT_LOAD_PAGEOFF12",
+        "POINTER_TO_GOT",
+        "TLVP_LOAD_PAGE21",
+        "TLVP_LOAD_PAGEOFF12",
+        "ADDEND",
+        "AUTHENTICATED_POINTER",
+    ];
+    symbol_print(s);
+    printf("fixup %s RELOC_%s\n", s.Sident.ptr, reloc[fixup]);
+}
+
+/****************************************
+ * Sort the array of Symbol pointers by their identifiers.
+ * Params:
+ *      symbols = array to be in-place sorted
+ */
+
+@trusted
+private void sortSymbols(Symbol*[] symbols)
+{
+    qsort(symbols.ptr, symbols.length, symbols.ptr.sizeof, &symbolQsortFp);
+}
+
+/** qsort() comparison function
+  */
+extern (C)
+@trusted
+private int symbolQsortFp(scope const(void*) e1, scope const(void*) e2)
+{   Symbol* s1 = *cast(Symbol**)e1;
+    Symbol* s2 = *cast(Symbol**)e2;
+
+    return strcmp(s1.Sident.ptr, s2.Sident.ptr);
+}
+
+alias _compare_fp_t = extern(C) nothrow int function(const void*, const void*);
+extern(C) void qsort(void* base, size_t nmemb, size_t size, _compare_fp_t compar);
+
+/*******************************************
+ * Search symbols[] for a Symbol that matches identifier.
+ * Params:
+ *      symbols = array of Symbols to search
+ *      identifier = which Symbol to search for
+ * Returns:
+ *      pointer to Symbol that matches identifier, or null if identifier is not found
+ */
+@trusted
+private Symbol* searchSymbols(Symbol*[] symbols, const(char)* identifier)
+{
+    /* binary search */
+    ptrdiff_t low = 0;
+    ptrdiff_t high = symbols.length - 1;  // high can be -1
+
+    char cp = *identifier++;
+
+    while (low <= high)
+    {
+        ptrdiff_t mid = low + ((high - low) >> 1);
+        const(char)* p = symbols[mid].Sident.ptr;
+
+        int cond = *p - cp;
+        if (cond == 0)
+            cond = strcmp(p + 1, identifier);
+
+        if (cond > 0)
+            high = mid - 1;
+        else if (cond < 0)
+            low = mid + 1;
+        else
+            return symbols[mid];  // match
+    }
+    return null;        // not found
+}
+
+unittest
+{
+    Symbol*[] s1;
+    assert(searchSymbols(s1, "x") == null);
+}

@@ -1,0 +1,166 @@
+/**
+ This module contains utility functions to help the implementation of the runtime hook
+
+  Copyright: Copyright Digital Mars 2000 - 2019.
+  License: Distributed under the
+       $(LINK2 http://www.boost.org/LICENSE_1_0.txt, Boost Software License 1.0).
+     (See accompanying file LICENSE)
+  Source: $(DRUNTIMESRC core/internal/_array/_utils.d)
+*/
+module core.internal.array.utils;
+
+import core.internal.traits : Parameters;
+import core.memory : GC;
+debug(PRINTF) import core.stdc.stdio : printf;
+
+alias BlkAttr = GC.BlkAttr;
+
+/**
+ * Check if the function `F` is callable in a `nothrow` scope.
+ * Params:
+ *  F = Function that does not take any parameters
+ * Returns:
+ *  if the function is callable in a `nothrow` scope.
+ */
+enum isNoThrow(alias F) = is(typeof(() nothrow { F(); }));
+
+/**
+ * Check if the type `T`'s postblit is called in nothrow, if it exists
+ * Params:
+ *  T = Type to check
+ * Returns:
+ *  if the postblit is callable in a `nothrow` scope, if it exists.
+ *  if it does not exist, return true.
+ */
+template isPostblitNoThrow(T) {
+    static if (__traits(isStaticArray, T))
+        enum isPostblitNoThrow = isPostblitNoThrow!(typeof(T.init[0]));
+    else static if (__traits(hasMember, T, "__xpostblit") &&
+        // Bugzilla 14746: Check that it's the exact member of S.
+        __traits(isSame, T, __traits(parent, T.init.__xpostblit)))
+        enum isPostblitNoThrow = isNoThrow!(T.init.__xpostblit);
+    else
+        enum isPostblitNoThrow = true;
+}
+
+/**
+ * Allocate a memory block with appendable capabilities for array usage.
+ *
+ * Params:
+ *  arrSize = size of the allocated array in bytes
+ * Returns:
+ *  `void[]` matching requested size on success, `null` on failure.
+ */
+void[] __arrayAlloc(T)(size_t arrSize) @trusted
+{
+    import core.lifetime : TypeInfoSize;
+    import core.internal.traits : hasIndirections;
+
+    enum typeInfoSize = TypeInfoSize!T;
+    enum uint attr = BlkAttr.APPENDABLE | GC.convertAlignmentToBlkAttr(T.alignof)
+        | (typeInfoSize ? BlkAttr.FINALIZE : 0)
+        | (!hasIndirections!T ? BlkAttr.NO_SCAN : 0);
+
+    version(D_TypeInfo)
+        auto ptr = GC.malloc(arrSize, attr, typeid(T));
+    else
+        auto ptr = GC.malloc(arrSize, attr, null);
+    if (ptr)
+        return ptr[0 .. arrSize];
+    return null;
+}
+
+// https://github.com/dlang/dmd/issues/22517
+@system unittest
+{
+    auto arr = new void[10];
+    assert((GC.getAttr(&arr[0]) & BlkAttr.NO_SCAN) == 0);
+}
+
+/**
+Given an array of length `size` that needs to be expanded to `newlength`,
+compute a new capacity.
+
+Better version by Dave Fladebo, enhanced by Steven Schveighoffer:
+This uses an inverse logarithmic algorithm to pre-allocate a bit more
+space for larger arrays.
+- The maximum "extra" space is about 80% of the requested space. This is for
+PAGE size and smaller.
+- As the arrays grow, the relative pre-allocated space shrinks.
+- Perhaps most importantly, overall memory usage and stress on the GC
+is decreased significantly for demanding environments.
+- The algorithm is tuned to avoid any division at runtime.
+
+Params:
+    newlength = new `.length`
+    elemsize = size of the element in the new array
+Returns: new capacity for array
+*/
+size_t newCapacity(size_t newlength, size_t elemsize) pure nothrow
+{
+    size_t newcap = newlength * elemsize;
+
+    /*
+     * Max growth factor numerator is 234, so allow for multiplying by 256.
+     * But also, the resulting size cannot be more than 2x, so prevent
+     * growing if 2x would fill up the address space (for 32-bit)
+     */
+    enum largestAllowed = (ulong.max >> 8) & (size_t.max >> 1);
+    if (!newcap || (newcap & ~largestAllowed))
+        return newcap;
+
+    /*
+     * The calculation for "extra" space depends on the requested capacity.
+     * We use an inverse logarithm of the new capacity to add an extra 15%
+     * to 83% capacity. Note that normally we humans think in terms of
+     * percent, but using 128 instead of 100 for the denominator means we
+     * can avoid all division by simply bit-shifting. Since there are only
+     * 64 bits in a long, the bsr of a size_t is going to be 0 - 63. Using
+     * a lookup table allows us to precalculate the multiplier based on the
+     * inverse logarithm. The formula roughly is:
+     *
+     * newcap = request * (1.0 + min(0.83, 10.0 / (log(request) + 1)))
+     */
+    import core.bitop;
+    static immutable multTable = (){
+        assert(__ctfe);
+        ulong[size_t.sizeof * 8] result;
+        foreach (i; 0 .. result.length)
+        {
+            auto factor = 128 + 1280 / (i + 1);
+            result[i] = factor > 234 ? 234 : factor;
+        }
+        return result;
+    }();
+
+    auto mult = multTable[bsr(newcap)];
+
+    // if this were per cent, then the code would look like:
+    // ((newlength * mult + 99) / 100) * elemsize
+    newcap = cast(size_t)((newlength * mult + 127) >> 7) * elemsize;
+    debug(PRINTF) printf("mult: %2.2f, alloc: %2.2f\n",mult/128.0,newcap / cast(double)elemsize);
+    debug(PRINTF) printf("newcap = %zd, newlength = %zd, elemsize = %zd\n", newcap, newlength, elemsize);
+    return newcap;
+}
+
+uint __typeAttrs(T)(void *copyAttrsFrom = null)
+{
+    import core.internal.traits : hasIndirections;
+    import core.memory : GC;
+
+    alias BlkAttr = GC.BlkAttr;
+
+    if (copyAttrsFrom)
+    {
+        // try to copy attrs from the given block
+        auto info = GC.query(copyAttrsFrom);
+        if (info.base)
+            return info.attr | GC.convertAlignmentToBlkAttr(T.alignof);
+    }
+
+    enum uint attrs = GC.convertAlignmentToBlkAttr(T.alignof)
+        | (!hasIndirections!T ? BlkAttr.NO_SCAN : 0)
+        | (is(T == struct) && __traits(needsDestruction, T) ? BlkAttr.FINALIZE : 0);
+
+    return attrs;
+}

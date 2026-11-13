@@ -1,7 +1,8 @@
+#!/usr/bin/env dub
 /+
 dub.sdl:
     name "config"
-    targetPath "generated/dub"
+    targetPath "generated/dub-gen"
 +/
 /**
 Generates the compiler version, the version printed with `dmd --version`.
@@ -19,16 +20,14 @@ void main(const string[] args)
     const outputDirectory = args[1];
     const versionFile = args[2];
 
-    version (Posix)
-        const sysConfigDirectory = args[3];
-
     mkdirRecurse(outputDirectory);
     const version_ = generateVersion(versionFile);
 
     updateIfChanged(buildPath(outputDirectory, "VERSION"), version_);
 
-    version (Posix)
+    if (args.length > 3)
     {
+        const sysConfigDirectory = args[3];
         const path = buildPath(outputDirectory, "SYSCONFDIR.imp");
         updateIfChanged(path, sysConfigDirectory);
     }
@@ -56,7 +55,7 @@ string generateVersion(const string versionFile)
     enum workDir = __FILE_FULL_PATH__.dirName;
     const result = execute(["git", "-C", workDir, "describe", "--dirty"]);
 
-    return result.status == 0 ? result.output.strip : versionFile.readText;
+    return result.status == 0 ? result.output.strip : versionFile.readText.strip;
 }
 
 /**

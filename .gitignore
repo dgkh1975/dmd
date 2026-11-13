@@ -1,24 +1,30 @@
 *.[oa]
 *.deps
+*.lst
+log*
 .B*
-test/test_results
-test/trace.def
-test/trace.log
+*~
+/compiler/src/dmd/lwv
+/compiler/src/dmd/new
+/compiler/src/bug2
+/compiler/test/test_results
+/compiler/test/trace.def
+/compiler/test/trace.log
 generated/
 *.obj
 *.map
 -.DS_Store
 -trace.def
 -trace.log
-*.lst
 .dub
+dub.selections.json
 
 # Visual Studio files
 *.exe
 *.pdb
-src/vcbuild/Win32
-src/vcbuild/x64
-src/vcbuild/.vs
+/compiler/src/vcbuild/Win32
+/compiler/src/vcbuild/x64
+/compiler/src/vcbuild/.vs
 *.ncb
 *.suo
 *.sdf
@@ -26,6 +32,7 @@ src/vcbuild/.vs
 *.user
 *.ilk
 ipch
+.vscode
 
 # Xcode files
 DerivedData/
@@ -33,13 +40,13 @@ xcuserdata/
 dmd.xcodeproj/
 
 # Output files
-src/*.bak
-src/*.lib
-src/*.lst
+/compiler/src/*.bak
+/compiler/src/*.lib
+/compiler/src/*.lst
 tags
 
 # OSX
-src/optabgen.dSYM/
+/compiler/src/optabgen.dSYM/
 
 # GCov
 *.gcno
@@ -48,3 +55,15 @@ src/optabgen.dSYM/
 # IntelliJ IDEA / CLion
 .idea/
 dmd.iml
+
+# Deliberately ignored files
+untracked_files/
+
+# Just in case
+/dmd
+.DS_Store
+/compiler/src/vcbuild/*.filters
+/compiler/src/vcbuild/*.sources
+
+/compiler/backend/old/*
+/compiler/backend/new/*

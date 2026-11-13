@@ -1,0 +1,682 @@
+/**
+ * Configure the back end (optimizer and code generator)
+ *
+ * Compiler implementation of the
+ * $(LINK2 https://www.dlang.org, D programming language).
+ *
+ * Copyright:   Copyright (C) 2000-2026 by The D Language Foundation, All Rights Reserved
+ * Authors:     $(LINK2 https://www.digitalmars.com, Walter Bright)
+ * License:     $(LINK2 https://www.boost.org/LICENSE_1_0.txt, Boost License 1.0)
+ * Source:      $(LINK2 https://github.com/dlang/dmd/blob/master/compiler/src/dmd/backend/backconfig.d, backend/backconfig.d)
+ */
+
+module dmd.backend.backconfig;
+
+import core.stdc.stdio;
+
+import dmd.backend.cdef;
+import dmd.backend.cc;
+import dmd.backend.code;
+import dmd.backend.global : ErrorCallbackBackend, error, errorCallbackBackend,
+    GetFileContentsCallback, getFileContentsCallback;
+import dmd.backend.go : go_flag, GlobalOptimizer;
+import dmd.backend.rtlsym : rtlsym_init;
+import dmd.backend.ty;
+import dmd.backend.type;
+
+import dmd.backend.dwarfdbginf;
+
+nothrow:
+@safe:
+
+/**************************************
+ * Initialize configuration for backend.
+ * Params:
+    arm           = true for generating AArch64 code
+    model         = 32 for 32 bit code,
+                    64 for 64 bit code,
+    exe           = true for exe file,
+                    false for dll or shared library (generate PIC code)
+    trace         =  add profiling code
+    nofloat       = do not pull in floating point code
+    vasm          = print generated assembler for each function
+    vasmName      = file name for vasm
+    verbose       = verbose compile
+    optimize      = optimize code
+    symdebug      = add symbolic debug information,
+                    1 for D,
+                    2 for fake it with C symbolic debug info
+    alwaysframe   = always create standard function frame
+    stackstomp    = add stack stomping code
+    ibt           = generate Indirect Branch Tracking code
+    avx           = use AVX instruction set (0, 1, 2)
+    pic           = position independence level (0, 1, 2)
+    useModuleInfo = implement ModuleInfo
+    useTypeInfo   = implement TypeInfo
+    useExceptions = implement exception handling
+    dwarf         = DWARF version used
+    _version      = Compiler version
+    exefmt        = Executable file format
+    generatedMain = a main entrypoint is generated
+    dataimports   = do not place data symbols into read-only segment,
+                    it might be necessary to resolve relocations at runtime
+    go            = the global optimizer state
+    errorCallback = callback for backend error messages
+ */
+public
+@trusted
+void out_config_init(
+        bool arm,       // true for generating AArch64 code
+        int model,
+        bool exe,
+        bool trace,
+        bool nofloat,
+        bool vasm,      // print generated assembler for each function
+        const(char)[] vasmName,
+        bool verbose,
+        bool optimize,
+        int symdebug,
+        bool alwaysframe,
+        bool stackstomp,
+        bool ibt,
+        ubyte avx,
+        ubyte pic,
+        bool useModuleInfo,
+        bool useTypeInfo,
+        bool useExceptions,
+        ubyte dwarf,
+        string _version,
+        exefmt_t exefmt,
+        bool generatedMain,     // a main entrypoint is generated
+        bool dataimports,
+        ref GlobalOptimizer go,
+        ErrorCallbackBackend errorCallback,
+        GetFileContentsCallback getFileContents)
+{
+    //printf("out_config_init()\n");
+
+    errorCallbackBackend = errorCallback;
+    getFileContentsCallback = getFileContents;
+    auto cfg = &config;
+
+    cfg._version = _version;
+    if (arm)
+        cfg.target_cpu = TARGET_AArch64;
+    if (!cfg.target_cpu)
+    {   cfg.target_cpu = TARGET_PentiumPro;
+        cfg.target_scheduler = cfg.target_cpu;
+    }
+    cfg.fulltypes = CVNONE;
+    cfg.fpxmmregs = false;
+    if (!arm)
+        cfg.inline8087 = 1;
+    cfg.memmodel = 0;
+    cfg.flags |= CFGuchar;   // make sure TYchar is unsigned
+    cfg.exe = exefmt;
+    tytab[TYchar] |= TYFLuns;
+    if (generatedMain)
+        cfg.flags2 |= CFG2genmain;
+    if (ibt)
+        cfg.flags3 |= CFG3ibt;
+
+    if (dwarf < 3 || dwarf > 5)
+    {
+        if (dwarf)
+        {
+            error(Srcpos.init, "DWARF version %u is not supported", dwarf);
+        }
+
+        // Default DWARF version
+        cfg.dwarf = 3;
+    }
+    else
+    {
+        cfg.dwarf = dwarf;
+    }
+
+    if (cfg.exe & EX_windos)
+    {
+        if (model == 64)
+        {
+            cfg.fpxmmregs = true;
+            cfg.avx = avx;
+            cfg.ehmethod = useExceptions ? EHmethod.EH_DM : EHmethod.EH_NONE;
+
+            //cfg.flags |= CFGalwaysframe;
+            cfg.flags |= CFGromable; // put switch tables in code segment
+        }
+        else
+        {
+            cfg.ehmethod = useExceptions ? EHmethod.EH_WIN32 : EHmethod.EH_NONE;
+        }
+        cfg.flags |= CFGnoebp;    // test suite fails without this
+        cfg.objfmt = OBJ_MSCOFF;
+
+        if (dataimports)
+            cfg.flags2 |= CFG2noreadonly;
+        if (exe)
+            cfg.wflags |= WFexe;         // EXE file only optimizations
+        cfg.flags4 |= CFG4underscore;
+    }
+    if (cfg.exe & (EX_LINUX | EX_LINUX64))
+    {
+        cfg.fpxmmregs = true;
+        cfg.avx = avx;
+        if (model == 64)
+        {
+            cfg.ehmethod = useExceptions ? EHmethod.EH_DWARF : EHmethod.EH_NONE;
+        }
+        else
+        {
+            cfg.ehmethod = useExceptions ? EHmethod.EH_DWARF : EHmethod.EH_NONE;
+            if (!exe)
+                cfg.flags |= CFGromable; // put switch tables in code segment
+        }
+        cfg.flags |= CFGnoebp;
+        switch (pic)
+        {
+            case 0:         // PIC.fixed
+                break;
+
+            case 1:         // PIC.pic
+                cfg.flags3 |= CFG3pic;
+                break;
+
+            case 2:         // PIC.pie
+                cfg.flags3 |= CFG3pic | CFG3pie;
+                break;
+
+            default:
+                assert(0);
+        }
+        if (symdebug)
+            cfg.flags |= CFGalwaysframe;
+
+        cfg.objfmt = OBJ_ELF;
+    }
+    if (cfg.exe & (EX_OSX | EX_OSX64))
+    {
+        cfg.fpxmmregs = true;
+        cfg.avx = avx;
+        cfg.ehmethod = useExceptions ? EHmethod.EH_DWARF : EHmethod.EH_NONE;
+        cfg.flags |= CFGnoebp;
+        if (!exe)
+        {
+            cfg.flags3 |= CFG3pic;
+            if (0 && model == 64)
+                cfg.flags |= CFGalwaysframe; // autotester fails without this
+                                                // https://issues.dlang.org/show_bug.cgi?id=21042
+                                                // https://github/dlang/dmd/issues/19746
+        }
+        if (symdebug)
+            cfg.flags |= CFGalwaysframe;
+        cfg.flags |= CFGromable; // put switch tables in code segment
+        cfg.objfmt = OBJ_MACH;
+    }
+    if (cfg.exe & (EX_FREEBSD | EX_FREEBSD64))
+    {
+        if (model == 64)
+        {
+            cfg.ehmethod = useExceptions ? EHmethod.EH_DWARF : EHmethod.EH_NONE;
+            cfg.fpxmmregs = true;
+            cfg.avx = avx;
+        }
+        else
+        {
+            cfg.ehmethod = useExceptions ? EHmethod.EH_DWARF : EHmethod.EH_NONE;
+            if (!exe)
+                cfg.flags |= CFGromable; // put switch tables in code segment
+        }
+        cfg.flags |= CFGnoebp;
+        if (!exe)
+        {
+            cfg.flags3 |= CFG3pic;
+        }
+        if (symdebug)
+            cfg.flags |= CFGalwaysframe;
+        cfg.objfmt = OBJ_ELF;
+    }
+    if (cfg.exe & (EX_OPENBSD | EX_OPENBSD64))
+    {
+        if (model == 64)
+        {
+            cfg.fpxmmregs = true;
+            cfg.avx = avx;
+        }
+        else
+        {
+            if (!exe)
+                cfg.flags |= CFGromable; // put switch tables in code segment
+        }
+        cfg.flags |= CFGnoebp;
+        cfg.flags |= CFGalwaysframe;
+        if (!exe)
+            cfg.flags3 |= CFG3pic;
+        cfg.objfmt = OBJ_ELF;
+        cfg.ehmethod = useExceptions ? EHmethod.EH_DWARF : EHmethod.EH_NONE;
+    }
+    if (cfg.exe == EX_DRAGONFLYBSD64)
+    {
+        if (model == 64)
+        {
+            cfg.ehmethod = useExceptions ? EHmethod.EH_DWARF : EHmethod.EH_NONE;
+            cfg.fpxmmregs = true;
+            cfg.avx = avx;
+        }
+        else
+        {
+            assert(0);                      // Only 64-bit supported on DragonFlyBSD
+        }
+        cfg.flags |= CFGnoebp;
+        if (!exe)
+        {
+            cfg.flags3 |= CFG3pic;
+            cfg.flags |= CFGalwaysframe; // PIC needs a frame for TLS fixups
+        }
+        cfg.objfmt = OBJ_ELF;
+    }
+    if (cfg.exe & (EX_SOLARIS | EX_SOLARIS64))
+    {
+        if (model == 64)
+        {
+            cfg.fpxmmregs = true;
+            cfg.avx = avx;
+        }
+        else
+        {
+            if (!exe)
+                cfg.flags |= CFGromable; // put switch tables in code segment
+        }
+        cfg.flags |= CFGnoebp;
+        cfg.flags |= CFGalwaysframe;
+        if (!exe)
+            cfg.flags3 |= CFG3pic;
+        cfg.objfmt = OBJ_ELF;
+        cfg.ehmethod = useExceptions ? EHmethod.EH_DWARF : EHmethod.EH_NONE;
+    }
+    else if (cfg.exe & (EX_HURD | EX_HURD64))
+    {
+        cfg.fpxmmregs = true;
+        cfg.avx = avx;
+        if (model == 64)
+        {
+            cfg.ehmethod = useExceptions ? EHmethod.EH_DWARF : EHmethod.EH_NONE;
+        }
+        else
+        {
+            cfg.ehmethod = useExceptions ? EHmethod.EH_DWARF : EHmethod.EH_NONE;
+            if (!exe)
+                cfg.flags |= CFGromable; // put switch tables in code segment
+        }
+        cfg.flags |= CFGnoebp;
+        switch (pic)
+        {
+            case 0:         // PIC.fixed
+                break;
+
+            case 1:         // PIC.pic
+                cfg.flags3 |= CFG3pic;
+                break;
+
+            case 2:         // PIC.pie
+                cfg.flags3 |= CFG3pic | CFG3pie;
+                break;
+
+            default:
+                assert(0);
+        }
+        if (symdebug)
+            cfg.flags |= CFGalwaysframe;
+
+        cfg.objfmt = OBJ_ELF;
+    }
+
+    cfg.flags2 |= CFG2nodeflib;      // no default library
+    cfg.flags3 |= CFG3eseqds;
+static if (0)
+{
+    if (env.getEEcontext().EEcompile != 2)
+        cfg.flags4 |= CFG4allcomdat;
+    if (env.nochecks())
+        cfg.flags4 |= CFG4nochecks;  // no runtime checking
+}
+    if (cfg.exe & (EX_OSX | EX_OSX64))
+    {
+    }
+    else
+    {
+        cfg.flags4 |= CFG4allcomdat;
+    }
+    if (trace)
+        cfg.flags |= CFGtrace;       // turn on profiler
+    if (nofloat)
+        cfg.flags3 |= CFG3wkfloat;
+
+    cfg.vasm = vasm;
+    cfg.vasmName = vasmName;
+    cfg.verbose = verbose;
+
+    go.AArch64 = arm;
+    if (optimize)
+        go_flag(go, cast(char*)"-o".ptr);
+
+    if (symdebug)
+    {
+        if (cfg.exe & (EX_LINUX | EX_LINUX64 | EX_OPENBSD | EX_OPENBSD64 | EX_FREEBSD | EX_FREEBSD64 | EX_DRAGONFLYBSD64 |
+                          EX_SOLARIS | EX_SOLARIS64 | EX_OSX | EX_OSX64 | EX_HURD | EX_HURD64))
+        {
+            cfg.addlinenumbers = 1;
+            cfg.fulltypes = (symdebug == 1) ? CVDWARF_D : CVDWARF_C;
+        }
+        if (cfg.exe & (EX_windos))
+        {
+            cfg.addlinenumbers = 1;
+            cfg.fulltypes = CV8;
+            if(symdebug > 1)
+                cfg.flags2 |= CFG2gms;
+        }
+        if (!optimize)
+            cfg.flags |= CFGalwaysframe;
+    }
+    else
+    {
+        cfg.addlinenumbers = 0;
+        cfg.fulltypes = CVNONE;
+        //cfg.flags &= ~CFGalwaysframe;
+    }
+
+    if (alwaysframe)
+        cfg.flags |= CFGalwaysframe;
+    if (stackstomp)
+        cfg.flags2 |= CFG2stomp;
+
+    cfg.useModuleInfo = useModuleInfo;
+    cfg.useTypeInfo = useTypeInfo;
+    cfg.useExceptions = useExceptions;
+
+    cod3_setdefault();
+    if (arm)
+    {
+        cfg.fpxmmregs = false; // add SIMD support later
+        util_setAArch64(cfg.exe);
+        type_init();
+        cod3_setAArch64();
+    }
+    else if (model == 64)
+    {
+        util_set64(cfg.exe);
+        type_init();
+        cod3_set64();
+    }
+    else
+    {
+        util_set32(cfg.exe);
+        type_init();
+        cod3_set32();
+    }
+
+    if (cfg.objfmt == OBJ_MACH)
+        machDebugSectionsInit();
+    else if (cfg.objfmt == OBJ_ELF)
+        elfDebugSectionsInit();
+    rtlsym_init(); // uses cgstate.fregsaved, so must be after it is set inside cod3_set*
+}
+
+/****************************
+ * Transmit internal compiler debugging flags.
+ */
+@trusted
+void out_config_debug(
+        bool b,
+        bool c,
+        bool f,
+        bool r,
+        bool w,
+        bool x,
+        bool y
+    )
+{
+    debugb = b;
+    debugc = c;
+    debugf = f;
+    debugr = r;
+    debugw = w;
+    debugx = x;
+    debugy = y;
+}
+
+
+/* Global flags:
+ */
+
+__gshared:
+bool debuga = 0; /// cg - watch assignaddr()
+bool debugb = 0; /// watch block optimization
+bool debugc = 0; /// watch code generated
+bool debuge = 0; /// dump eh info
+bool debugf = 0; /// trees after dooptim
+bool debugr = 0; /// watch register allocation
+bool debugs = 0; /// watch common subexp eliminator
+bool debugw = 0; /// watch progress
+bool debugx = 0; /// suppress predefined CPP stuff
+bool debugy = 0; /// watch output to il buffer
+
+/*************************************
+ */
+
+@trusted
+void util_set16()
+{
+    // The default is 16 bits
+    _tysize[TYreal] = 10;
+    _tysize[TYireal] = 10;
+    _tysize[TYcreal] = 20;
+
+    _tyalignsize[TYreal] = 2;
+    _tyalignsize[TYireal] = 2;
+    _tyalignsize[TYcreal] = 2;
+}
+
+/*******************************
+ * Redo tables from 8086/286 to 386/486.
+ */
+
+@trusted
+void util_set32(exefmt_t exe)
+{
+    _tyrelax[TYenum] = TYlong;
+    _tyrelax[TYint]  = TYlong;
+    _tyrelax[TYuint] = TYlong;
+
+    tyequiv[TYint] = TYlong;
+    tyequiv[TYuint] = TYulong;
+
+    _tysize[TYenum] = LONGSIZE;
+    _tysize[TYint ] = LONGSIZE;
+    _tysize[TYuint] = LONGSIZE;
+    _tysize[TYnullptr] = LONGSIZE;
+    _tysize[TYnptr] = LONGSIZE;
+    _tysize[TYnref] = LONGSIZE;
+if (exe & (EX_LINUX | EX_LINUX64 | EX_FREEBSD | EX_FREEBSD64 | EX_OPENBSD | EX_OPENBSD64 | EX_DRAGONFLYBSD64 | EX_SOLARIS | EX_SOLARIS64 | EX_HURD | EX_HURD64))
+{
+    _tysize[TYreal] = 12;
+    _tysize[TYireal] = 12;
+    _tysize[TYcreal] = 24;
+}
+if (exe & (EX_OSX | EX_OSX64))
+{
+    _tysize[TYreal] = 16;
+    _tysize[TYireal] = 16;
+    _tysize[TYcreal] = 32;
+}
+if (exe & EX_windos)
+{
+    _tysize[TYreal] = 10;
+    _tysize[TYireal] = 10;
+    _tysize[TYcreal] = 20;
+}
+
+    _tysize[TYsptr] = LONGSIZE;
+    _tysize[TYcptr] = LONGSIZE;
+    _tysize[TYfptr] = 6;     // NOTE: There are codgen test that check
+    _tysize[TYvptr] = 6;     // _tysize[x] == _tysize[TYfptr] so don't set
+    _tysize[TYfref] = 6;     // _tysize[TYfptr] to _tysize[TYnptr]
+
+    _tyalignsize[TYenum] = LONGSIZE;
+    _tyalignsize[TYint ] = LONGSIZE;
+    _tyalignsize[TYuint] = LONGSIZE;
+    _tyalignsize[TYnullptr] = LONGSIZE;
+    _tyalignsize[TYnref] = LONGSIZE;
+    _tyalignsize[TYnptr] = LONGSIZE;
+if (exe & (EX_LINUX | EX_LINUX64 | EX_FREEBSD | EX_FREEBSD64 | EX_OPENBSD | EX_OPENBSD64 | EX_DRAGONFLYBSD64 | EX_SOLARIS | EX_SOLARIS64 | EX_HURD | EX_HURD64))
+{
+    _tyalignsize[TYreal] = 4;
+    _tyalignsize[TYireal] = 4;
+    _tyalignsize[TYcreal] = 4;
+}
+else if (exe & (EX_OSX | EX_OSX64))
+{
+    _tyalignsize[TYreal] = 16;
+    _tyalignsize[TYireal] = 16;
+    _tyalignsize[TYcreal] = 16;
+}
+if (exe & EX_windos)
+{
+    _tyalignsize[TYreal] = 2;
+    _tyalignsize[TYireal] = 2;
+    _tyalignsize[TYcreal] = 2;
+}
+
+    _tyalignsize[TYsptr] = LONGSIZE;
+    _tyalignsize[TYcptr] = LONGSIZE;
+    _tyalignsize[TYfptr] = LONGSIZE;     // NOTE: There are codgen test that check
+    _tyalignsize[TYvptr] = LONGSIZE;     // _tysize[x] == _tysize[TYfptr] so don't set
+    _tyalignsize[TYfref] = LONGSIZE;     // _tysize[TYfptr] to _tysize[TYnptr]
+
+    _tysize[TYimmutPtr] = _tysize[TYnptr];
+    _tysize[TYsharePtr] = _tysize[TYnptr];
+    _tysize[TYrestrictPtr] = _tysize[TYnptr];
+    _tysize[TYfgPtr] = _tysize[TYnptr];
+    _tyalignsize[TYimmutPtr] = _tyalignsize[TYnptr];
+    _tyalignsize[TYsharePtr] = _tyalignsize[TYnptr];
+    _tyalignsize[TYrestrictPtr] = _tyalignsize[TYnptr];
+    _tyalignsize[TYfgPtr] = _tyalignsize[TYnptr];
+}
+
+/*******************************
+ * Redo tables from 8086/286 to I64.
+ */
+
+@trusted
+void util_set64(exefmt_t exe)
+{
+    _tyrelax[TYenum] = TYlong;
+    _tyrelax[TYint]  = TYlong;
+    _tyrelax[TYuint] = TYlong;
+
+    tyequiv[TYint] = TYlong;
+    tyequiv[TYuint] = TYulong;
+
+    _tysize[TYenum] = LONGSIZE;
+    _tysize[TYint ] = LONGSIZE;
+    _tysize[TYuint] = LONGSIZE;
+    _tysize[TYnullptr] = 8;
+    _tysize[TYnptr] = 8;
+    _tysize[TYnref] = 8;
+    if (exe & (EX_LINUX | EX_LINUX64 | EX_FREEBSD | EX_FREEBSD64 | EX_OPENBSD |
+                      EX_OPENBSD64 | EX_DRAGONFLYBSD64 | EX_SOLARIS | EX_SOLARIS64 | EX_OSX | EX_OSX64 | EX_HURD | EX_HURD64))
+    {
+        _tysize[TYreal] = 16;
+        _tysize[TYireal] = 16;
+        _tysize[TYcreal] = 32;
+    }
+    if (exe & EX_windos)
+    {
+        _tysize[TYreal] = 10;
+        _tysize[TYireal] = 10;
+        _tysize[TYcreal] = 20;
+    }
+    _tysize[TYsptr] = 8;
+    _tysize[TYcptr] = 8;
+    _tysize[TYfptr] = 10;    // NOTE: There are codgen test that check
+    _tysize[TYvptr] = 10;    // _tysize[x] == _tysize[TYfptr] so don't set
+    _tysize[TYfref] = 10;    // _tysize[TYfptr] to _tysize[TYnptr]
+
+    _tyalignsize[TYenum] = LONGSIZE;
+    _tyalignsize[TYint ] = LONGSIZE;
+    _tyalignsize[TYuint] = LONGSIZE;
+    _tyalignsize[TYnullptr] = 8;
+    _tyalignsize[TYnptr] = 8;
+    _tyalignsize[TYnref] = 8;
+    if (exe & (EX_LINUX | EX_LINUX64 | EX_FREEBSD | EX_FREEBSD64 | EX_OPENBSD | EX_OPENBSD64 | EX_DRAGONFLYBSD64 | EX_SOLARIS | EX_SOLARIS64 | EX_HURD | EX_HURD64))
+    {
+        _tyalignsize[TYreal] = 16;
+        _tyalignsize[TYireal] = 16;
+        _tyalignsize[TYcreal] = 16;
+    }
+    if (exe & (EX_OSX | EX_OSX64))
+    {
+        _tyalignsize[TYreal] = 16;
+        _tyalignsize[TYireal] = 16;
+        _tyalignsize[TYcreal] = 16;
+    }
+    if (exe & EX_windos)
+    {
+        _tyalignsize[TYreal] = 2;
+        _tyalignsize[TYireal] = 2;
+        _tyalignsize[TYcreal] = 2;
+    }
+    _tyalignsize[TYsptr] = 8;
+    _tyalignsize[TYcptr] = 8;
+    _tyalignsize[TYfptr] = 8;
+    _tyalignsize[TYvptr] = 8;
+    _tyalignsize[TYfref] = 8;
+    tytab[TYjfunc] &= ~TYFLpascal;  // set so caller cleans the stack (as in C)
+
+    TYptrdiff = TYllong;
+    TYsize = TYullong;
+    TYsize_t = TYullong;
+    TYdelegate = TYcent;
+    TYdarray = TYucent;
+
+    _tysize[TYimmutPtr] = _tysize[TYnptr];
+    _tysize[TYsharePtr] = _tysize[TYnptr];
+    _tysize[TYrestrictPtr] = _tysize[TYnptr];
+    _tysize[TYfgPtr] = _tysize[TYnptr];
+    _tyalignsize[TYimmutPtr] = _tyalignsize[TYnptr];
+    _tyalignsize[TYsharePtr] = _tyalignsize[TYnptr];
+    _tyalignsize[TYrestrictPtr] = _tyalignsize[TYnptr];
+    _tyalignsize[TYfgPtr] = _tyalignsize[TYnptr];
+}
+
+@trusted
+void util_setAArch64(exefmt_t exe)
+{
+    util_set64(exe);
+
+    if (exe & EX_windos)
+    {
+        _tysize[TYreal] = 16;
+        _tysize[TYireal] = 16;
+        _tysize[TYcreal] = 32;
+    }
+    if (exe & EX_windos)
+    {
+        _tyalignsize[TYreal] = 16;
+        _tyalignsize[TYireal] = 16;
+        _tyalignsize[TYcreal] = 16;
+    }
+
+    if (exe & EX_OSX64)
+    {
+        _tysize[TYreal] = 8;
+        _tysize[TYireal] = 8;
+        _tysize[TYcreal] = 16;
+    }
+    if (exe & EX_OSX64)
+    {
+        _tyalignsize[TYreal] = 8;
+        _tyalignsize[TYireal] = 8;
+        _tyalignsize[TYcreal] = 8;
+    }
+}

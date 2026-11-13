@@ -1,0 +1,154 @@
+// REQUIRED_ARGS: -m64
+/*
+TEST_OUTPUT:
+---
+fail_compilation/iasm1.d(103): Error: `and` instruction requires operands of matching type/size
+fail_compilation/iasm1.d(104): Error: `and` instruction requires operands of matching type/size
+---
+*/
+
+// https://issues.dlang.org/show_bug.cgi?id=15999
+
+#line 100
+
+void test100(ulong bar)
+{
+    asm { and RAX, 0xFFFFFFFF00000000; ret; }
+    asm { and RAX, 0x00000000FFFFFFFF; ret; }
+}
+
+/***********************************************/
+
+/*
+TEST_OUTPUT:
+---
+fail_compilation/iasm1.d(213): Error: bad type/size of operands `opDispatch!"foo"`
+---
+*/
+
+// https://issues.dlang.org/show_bug.cgi?id=15239
+
+#line 200
+
+struct T
+{
+    template opDispatch(string Name, P...)
+    {
+        static void opDispatch(P) {}
+    }
+}
+
+void test2()
+{
+    asm
+    {
+        call T.foo;
+    }
+}
+
+/*********************************************/
+
+/* TEST_OUTPUT:
+---
+fail_compilation/iasm1.d(306): Error: operand cannot have both R8 and [R9]
+fail_compilation/iasm1.d(307): Error: operand cannot have both RDX and 0x3
+fail_compilation/iasm1.d(308): Error: cannot have two symbols in addressing mode
+fail_compilation/iasm1.d(309): Error: RIP-relative addressing cannot be combined with another register
+fail_compilation/iasm1.d(310): Error: RIP-relative addressing cannot be combined with another register
+fail_compilation/iasm1.d(311): Error: RIP-relative addressing cannot be combined with another register
+fail_compilation/iasm1.d(312): Error: RIP-relative addressing cannot be combined with another register
+fail_compilation/iasm1.d(313): Error: RIP-relative addressing cannot be combined with another register
+fail_compilation/iasm1.d(314): Error: RIP-relative addressing cannot be combined with another register
+---
+*/
+
+// https://issues.dlang.org/show_bug.cgi?id=17616
+// https://issues.dlang.org/show_bug.cgi?id=18373
+// https://github.com/dlang/dmd/issues/20036
+
+#line 300
+
+void test3()
+{
+    asm
+    {
+        naked;
+        mov RAX,[R9][R10]R8;
+        mov RAX,[3]RDX;
+	mov RAX,[RIP][RIP];
+	mov RAX,[RIP][RCX];
+	mov RAX,[RIP]RCX;
+	mov RAX, [RIP+RAX];
+	mov RAX, [RAX+RIP];
+	mov RAX, [RAX*2+RIP];
+	mov RAX, [RIP+RAX*2];
+    }
+}
+
+/*********************************************/
+
+/*
+TEST_OUTPUT:
+---
+fail_compilation/iasm1.d(403): Error: expression expected not `;`
+fail_compilation/iasm1.d(403): Error: `]` expected instead of `;`
+---
+*/
+
+#line 400
+
+void test4()
+{
+    asm { inc [; }
+}
+
+/*********************************************/
+
+/* TEST_OUTPUT:
+---
+fail_compilation/iasm1.d(505): Error: function `iasm1.test5` label `L1` is undefined
+---
+*/
+
+#line 500
+
+void test5()
+{
+    asm
+    {
+        jmp L1;
+    L2:
+        nop;
+    }
+}
+
+/*********************************************/
+
+/* TEST_OUTPUT:
+---
+fail_compilation/iasm1.d(615): Error: delegate `iasm1.test6.__foreachbody_L611_C5` label `L1` is undefined
+---
+*/
+
+#line 600
+
+struct S
+{
+    static int opApply(int delegate(ref int) dg)
+    {
+        return 0;
+    }
+}
+
+void test6()
+{
+    foreach(f; S)
+    {
+        asm
+        {
+            jmp L1;
+        }
+        goto L1;
+    }
+    L1:;
+}

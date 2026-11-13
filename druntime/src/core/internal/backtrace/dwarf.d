@@ -1,0 +1,1577 @@
+/**
+ * Generates a human-readable stack-trace on POSIX targets using DWARF
+ *
+ * The common use case for printing a stack trace is when `toString` is called
+ * on a `Throwable` (see `object.d`). It will iterate on what is likely to be
+ * the default trace handler (see `core.runtime : defaultTraceHandler`).
+ * The class returned by `defaultTraceHandler` is what ends up calling into
+ * this module, through the use of `core.internal.traits : externDFunc`.
+ *
+ * The entry point of this module is `traceHandlerOpApplyImpl`,
+ * and the only really "public" symbol (since all `rt` symbols are private).
+ * In the future, this implementation should probably be made idiomatic,
+ * so that it can for example work with attributes.
+ *
+ * Resilience:
+ * As this module is used for diagnostic, it should handle failures
+ * as gracefully as possible. Having the runtime error out on printing
+ * the stack trace one is trying to debug would be quite a terrible UX.
+ * For this reason, this module works on a "best effort" basis and will
+ * sometimes print mangled symbols, or "???" when it cannot do anything
+ * more useful.
+ *
+ * Source_of_data:
+ * This module uses two main sources for generating human-readable data.
+ * First, it uses `backtrace_symbols` to obtain the name of the symbols
+ * (functions or methods) associated with the addresses.
+ * Since the names are mangled, it will also call into `core.demangle`,
+ * and doesn't need to use any DWARF information for this,
+ * however a future extension  could make use of the call frame information
+ * (See DWARF4 "6.4 Call Frame Information", PDF page 126).
+ *
+ * The other piece of data used is the DWARF `.debug_line` section,
+ * which contains the line informations of a program, necessary to associate
+ * the instruction address with its (file, line) information.
+ *
+ * Since debug lines informations are quite large, they are encoded using a
+ * program that is to be fed to a finite state machine.
+ * See `runStateMachine` and `readLineNumberProgram` for more details.
+ *
+ * DWARF_Version:
+ * This module only supports DWARF 3, 4 and 5.
+ *
+ * Reference: http://www.dwarfstd.org/
+ * Copyright: Copyright Digital Mars 2015 - 2015.
+ * License:   $(HTTP www.boost.org/LICENSE_1_0.txt, Boost License 1.0).
+ * Authors:   Yazan Dabain, Sean Kelly
+ * Source: $(DRUNTIMESRC core/internal/backtrace/dwarf.d)
+ */
+
+module core.internal.backtrace.dwarf;
+
+version (Posix):
+
+version (WASI) {}
+else:
+
+import core.internal.string;
+
+version (OSX)
+    version = Darwin;
+else version (iOS)
+    version = Darwin;
+else version (TVOS)
+    version = Darwin;
+else version (WatchOS)
+    version = Darwin;
+
+version (Darwin)
+    import core.internal.backtrace.macho;
+else
+    import core.internal.backtrace.elf;
+
+import core.internal.container.array;
+import core.stdc.string : strlen, memcpy;
+
+//debug = DwarfDebugMachine;
+debug(DwarfDebugMachine) import core.stdc.stdio : printf;
+
+struct Location
+{
+    /**
+     * Address of the instruction for which this location is for.
+     */
+    const(void)* address;
+
+    /**
+     * The name of the procedure, or function, this address is in.
+     */
+    const(char)[] procedure;
+
+    /**
+     * Path to the file this location references, relative to `directory`
+     *
+     * Note that depending on implementation, this could be just a name,
+     * a relative path, or an absolute path.
+     *
+     * If no debug info is present, this may be `null`.
+     */
+    const(char)[] file;
+
+    /**
+     * Directory where `file` resides
+     *
+     * This may be `null`, either if there is no debug info,
+     * or if the compiler implementation doesn't use this feature (e.g. DMD).
+     */
+    const(char)[] directory;
+
+    /**
+     * Compilation directory of the unit this location belongs to
+     *
+     * Per the DWARF spec, a relative `directory` (or a relative `file`
+     * without `directory`) is relative to this directory.
+     * This may be `null` if it's unknown or not needed.
+     */
+    const(char)[] compilationDirectory;
+
+    /**
+     * Line within the file that correspond to this `location`.
+     *
+     * Note that in addition to a positive value, the values `0` and `-1`
+     * are to be expected by consumers. A value of `0` means that the code
+     * is not attributable to a specific line in the file, e.g. module-specific
+     * generated code, and `-1` means that no debug info could be found.
+     */
+    int line = -1;
+
+    /// Format this location into a human-readable string
+    void toString (scope void delegate(scope const char[]) sink) const
+    {
+        import core.demangle;
+
+        // If there's no file information, there shouldn't be any directory
+        // information. If there is we will simply ignore it.
+        if (this.file.length)
+        {
+            // Only POSIX path because this module is not used on Windows
+            static bool isAbsolute(const(char)[] path) { return path.length && path[0] == '/'; }
+            void sinkDir(const(char)[] dir)
+            {
+                if (!dir.length)
+                    return;
+                sink(dir);
+                if (dir[$ - 1] != '/')
+                    sink("/");
+            }
+
+            const(char)[] file = this.file;
+            if (!isAbsolute(file))
+            {
+                if (!isAbsolute(this.directory))
+                    sinkDir(this.compilationDirectory);
+                sinkDir(this.directory);
+                // Avoid printing e.g. `/path/to/./file.d`
+                if ((this.directory.length || this.compilationDirectory.length) &&
+                    file.length > 2 && file[0 .. 2] == "./")
+                    file = file[2 .. $];
+            }
+            sink(file);
+        }
+        else
+            // Most likely, no debug information
+            sink("??");
+
+        // Also no debug infos
+        if (this.line < 0)
+            sink(":?");
+        // Line can be 0, e.g. if the frame is in generated code
+        else if (this.line)
+        {
+            sink(":");
+            sink(signedToTempString(this.line));
+        }
+
+        char[1024] symbolBuffer = void;
+        // When execinfo style is used, procedure can be null if the format
+        // of the line cannot be read, but it generally should not happen
+        if (this.procedure.length)
+        {
+            sink(" ");
+            sink(demangle(this.procedure, symbolBuffer, getCXXDemangler()));
+        }
+
+        sink(" [0x");
+        sink(unsignedToTempString!16(cast(size_t) this.address));
+        sink("]");
+    }
+}
+
+unittest
+{
+    static string format(Location loc)
+    {
+        loc.line = 42;
+        string result;
+        loc.toString((scope const char[] s) { result ~= s; });
+        return result[0 .. $ - " [0x0]".length];
+    }
+
+    // DMD: Fully qualified file name
+    assert(format(Location(file: "/a/b.d")) == "/a/b.d:42");
+    // Relative file in absolute directory
+    assert(format(Location(file: "b.d", directory: "/a")) == "/a/b.d:42");
+    assert(format(Location(file: "b.d", directory: "/a/", compilationDirectory: "/c")) == "/a/b.d:42");
+    // Relative directory, relative to compilation directory
+    assert(format(Location(file: "b.d", directory: "a", compilationDirectory: "/")) == "/a/b.d:42");
+    assert(format(Location(file: "b.d", directory: "a", compilationDirectory: "/c")) == "/c/a/b.d:42");
+    // File relative to compilation directory
+    assert(format(Location(file: "b.d", compilationDirectory: "/c")) == "/c/b.d:42");
+    assert(format(Location(file: "./b.d", compilationDirectory: "/c")) == "/c/b.d:42");
+    assert(format(Location(file: "./b.d")) == "./b.d:42");
+    // Unknown
+    assert(format(Location()) == "??:42");
+}
+
+int traceHandlerOpApplyImpl(size_t numFrames,
+                            scope const(void)* delegate(size_t) getNthAddress,
+                            scope const(char)[] delegate(size_t) getNthFuncName,
+                            scope int delegate(ref size_t, ref const(char[])) dg)
+{
+    auto image = Image.openSelf();
+
+    Array!Location locations;
+    locations.length = numFrames;
+    size_t startIdx;
+    foreach (idx; 0 .. numFrames)
+    {
+        locations[idx].address = getNthAddress(idx);
+        locations[idx].procedure = getNthFuncName(idx);
+
+        // NOTE: The first few frames with the current implementation are
+        //       inside core.runtime and the object code, so eliminate
+        //       these for readability.
+        // They also might depend on build parameters, which would make
+        // using a fixed number of frames otherwise brittle.
+        version (LDC) enum BaseExceptionFunctionName = "_d_throw_exception";
+        else          enum BaseExceptionFunctionName = "_d_throwdwarf";
+        if (!startIdx && locations[idx].procedure == BaseExceptionFunctionName)
+            startIdx = idx + 1;
+    }
+
+
+    if (!image.isValid())
+        return locations[startIdx .. $].processCallstack(null, 0, dg);
+
+    // find address -> file, line mapping using dwarf debug_line
+    return image.processDebugSections(
+        (ref const DebugSections sections) => locations[startIdx .. $].processCallstack(&sections, image.baseAddress, dg));
+}
+
+/// The DWARF sections used to resolve addresses, empty if not present
+struct DebugSections
+{
+    /// `.debug_line`: line number programs
+    const(ubyte)[] line;
+    /// `.debug_info`: used to look up the compilation directory (DWARF < 5)
+    const(ubyte)[] info;
+    /// `.debug_abbrev`: abbreviations needed to decode `.debug_info`
+    const(ubyte)[] abbrev;
+    /// `.debug_str`: string table referenced by `DW_FORM_strp`
+    const(ubyte)[] str;
+    /// `.debug_line_str`: string table referenced by `DW_FORM_line_strp`
+    const(ubyte)[] lineStr;
+}
+
+struct TraceInfoBuffer
+{
+    private char[1536] buf = void;
+    private size_t position;
+
+    // BUG: https://issues.dlang.org/show_bug.cgi?id=21285
+    @safe pure nothrow @nogc
+    {
+        ///
+        inout(char)[] opSlice() inout return
+        {
+            return this.buf[0 .. this.position > $ ? $ : this.position];
+        }
+
+        ///
+        void reset()
+        {
+            this.position = 0;
+        }
+    }
+
+    /// Used as `sink` argument to `Location.toString`
+    void put(scope const char[] data)
+    {
+        // We cannot write anymore
+        if (this.position > this.buf.length)
+            return;
+
+        if (this.position + data.length > this.buf.length)
+        {
+            this.buf[this.position .. $] = data[0 .. this.buf.length - this.position];
+            this.buf[$ - 3 .. $] = "...";
+            // +1 is a marker for the '...', otherwise if the symbol
+            // name was to exactly fill the buffer,
+            // we'd discard anything else without printing the '...'.
+            this.position = this.buf.length + 1;
+            return;
+        }
+
+        this.buf[this.position .. this.position + data.length] = data;
+        this.position += data.length;
+    }
+}
+
+private:
+
+int processCallstack(Location[] locations, const(DebugSections)* sections,
+                     size_t baseAddress, scope int delegate(ref size_t, ref const(char[])) dg)
+{
+    const hasDebugLine = sections !is null && sections.line.length;
+    if (hasDebugLine)
+        resolveAddresses(*sections, locations, baseAddress);
+    version (Darwin)
+    {
+        if (!hasDebugLine)
+            resolveAddressesWithAtos(locations);
+    }
+
+    TraceInfoBuffer buffer;
+    foreach (idx, const ref loc; locations)
+    {
+        buffer.reset();
+        loc.toString(&buffer.put);
+
+        auto lvalue = buffer[];
+        if (auto ret = dg(idx, lvalue))
+            return ret;
+
+        if (loc.procedure == "_Dmain")
+            break;
+    }
+
+    return 0;
+}
+
+version (Darwin) {
+    /**
+     * Resolve the addresses of `locations` using `atos` (executable that ships with XCode)
+     *
+     * Spawns a child process that calls `atos`. Communication is through stdin/stdout pipes.
+     *
+     * After this function successfully completes, `locations` will contain
+     * file / lines informations.
+     *
+     * The lifetime of the `Location` data surpases function return (strndup is used).
+     *
+     * Params:
+     * locations = The locations to resolve
+     */
+    private void resolveAddressesWithAtos(Location[] locations) @nogc nothrow
+    {
+        import core.stdc.stdio : fclose, fflush, fgets, fprintf, printf, snprintf;
+        import core.stdc.stdlib : exit;
+        import core.sys.posix.stdio : fdopen;
+        import core.sys.posix.unistd : close, dup2, execlp, fork, getpid, pipe;
+        import core.sys.posix.sys.wait : waitpid;
+        // Create in/out pipes to communicate with the forked exec
+        int[2] dummy_pipes; // these dummy pipes are there to prevent funny issues when stdin/stdout is closed and pipe returns id 0 or 1
+        int[2] pipes_to_atos;
+        int[2] pipes_from_atos;
+        if ( pipe(dummy_pipes) < 0 || pipe(pipes_to_atos) < 0 || pipe(pipes_from_atos) < 0 ) {
+            printf("some pipe creation error!\n");
+            return;
+        }
+        close(dummy_pipes[0]);
+        close(dummy_pipes[1]);
+        auto write_to_atos = pipes_to_atos[1];
+        auto read_from_atos = pipes_from_atos[0];
+        auto atos_stdin = pipes_to_atos[0];
+        auto atos_stdout = pipes_from_atos[1];
+        auto self_pid = cast(int) getpid();
+        // Spawn a child process that calls atos, reads/writes from the pipes, and then exits.
+        auto child_id = fork();
+        if (child_id == -1)
+        {
+            printf("some fork error!\n");
+            return;
+        }
+        else if (child_id == 0)
+        {
+            // We are in the child process, spawn atos and link pipes
+            // Close unused read/write ends of pipes
+            close(write_to_atos);
+            close(read_from_atos);
+            // Link pipes to stdin/stdout
+            dup2(atos_stdin, 0);
+            close(atos_stdin);
+            dup2(atos_stdout, 1);
+            close(atos_stdout);
+            char[10] pid_str;
+            snprintf(pid_str.ptr, pid_str.sizeof, "%d", cast(int) self_pid);
+            const(char)* atos_executable = "atos";
+            const(char)* atos_p_arg = "-p";
+            const(char)* atos_fullpath_arg = "-fullPath";
+            execlp(atos_executable, atos_executable, atos_fullpath_arg, atos_p_arg, pid_str.ptr, null);
+            // If exec returns, an error occurred, need to exit the forked process here.
+            printf("some exec error!\n");
+            exit(0);
+        }
+        // Parent process just continues from here.
+        // Close unused pipes
+        close(atos_stdin);
+        close(atos_stdout);
+        auto to_atos = fdopen(write_to_atos, "w");
+        auto from_atos = fdopen(read_from_atos, "r");
+        // buffer for atos reading. Note that symbol names can be super large...
+        static char[16 * 1024] read_buffer = void;
+        char* status_ptr = null;
+        foreach (ref loc; locations)
+        {
+            fprintf(to_atos, "%p\n", loc.address);
+            fflush(to_atos);
+            read_buffer[0] = '\0';
+            status_ptr = fgets(read_buffer.ptr, read_buffer.sizeof, from_atos);
+            if (!status_ptr)
+                break;
+            Location parsed_loc = parseAtosLine(read_buffer.ptr);
+            if (parsed_loc.line != -1)
+            {
+                // Only update the file:line info, keep the procedure name as found before (preserving the standard truncation).
+                loc.file = parsed_loc.file;
+                loc.line = parsed_loc.line;
+            }
+        }
+        if (!status_ptr)
+            printf("\nDid not succeed in using 'atos' for extra debug information.\n");
+        fclose(to_atos);
+        fclose(from_atos);
+        close(write_to_atos);
+        close(read_from_atos);
+        waitpid(child_id, null, 0);
+    }
+    private Location parseAtosLine(char* buffer) @nogc nothrow
+    {
+        // The line from `atos` is in one of these formats:
+        // myfunction (in library.dylib) (sourcefile.c:17)
+        // myfunction (in library.dylib) + 0x1fe
+        // myfunction (in library.dylib) + 15
+        // 0xdeadbeef (in library.dylib) + 0x1fe
+        // 0xdeadbeef (in library.dylib) + 15
+        // 0xdeadbeef (in library.dylib)
+        // 0xdeadbeef
+        import core.stdc.stdlib : atoi;
+        import core.stdc.string : strchr, strstr;
+        import core.sys.posix.string : strndup;
+        Location loc;
+        if (!buffer)
+            return loc;
+        if (buffer[0] == '0' && buffer[1] == 'x')
+            // no named symbol found
+            return loc;
+        const symbolname_end = strstr(buffer, " (in ");
+        if (!symbolname_end)
+            return loc;
+        const symbolname_size = symbolname_end - buffer;
+        loc.procedure = strndup(buffer, symbolname_size)[0..symbolname_size];
+        const filename_start = strstr(symbolname_end, ") (") + 3;
+        if (cast(size_t)filename_start < 4)
+            return loc;
+        const colon_location = strchr(filename_start, ':');
+        if (!colon_location)
+            return loc;
+        const filename_size = colon_location - filename_start;
+        loc.file = strndup(filename_start, filename_size)[0..filename_size];
+        const final_paren = strchr(colon_location+1, ')');
+        if (!final_paren)
+            return loc;
+        loc.line = atoi(colon_location+1);
+        return loc;
+    }
+}
+
+/**
+ * Resolve the addresses of `locations` using the `.debug_line` section
+ *
+ * Runs the DWARF state machine on `debugLineSectionData`,
+ * assuming it represents a debugging program describing the addresses
+ * in a continous and increasing manner.
+ *
+ * After this function successfully completes, `locations` will contains
+ * file / lines informations.
+ *
+ * Note that the lifetime of the `Location` data is bound to the lifetime
+ * of the data in `sections`.
+ *
+ * Params:
+ *   sections = The DWARF sections, `line` being the program to feed the state machine
+ *   locations = The locations to resolve
+ *   baseAddress = The offset to apply to every address
+ */
+void resolveAddresses(ref const DebugSections sections, Location[] locations, size_t baseAddress) @nogc nothrow
+{
+    size_t numberOfLocationsFound = 0;
+
+    const(ubyte)[] dbg = sections.line;
+    while (dbg.length > 0)
+    {
+        debug(DwarfDebugMachine) printf("new debug program\n");
+        const lp = readLineNumberProgram(dbg, sections);
+
+        // Relative paths are relative to the compilation directory, which is
+        // the first include directory in DWARF 5, and found in `.debug_info`
+        // for previous versions. Look the latter up lazily, as it's expensive.
+        bool compDirLookedUp;
+        const(char)[] compDir;
+        const(char)[] getCompilationDirectory()
+        {
+            if (lp.dwarfVersion >= 5)
+                return lp.includeDirectories.length ? lp.includeDirectories[0] : null;
+            if (!compDirLookedUp)
+            {
+                compDir = findCompilationDirectory(sections, lp.offset);
+                compDirLookedUp = true;
+            }
+            return compDir;
+        }
+
+        LocationInfo lastLoc = LocationInfo(-1, -1);
+        const(void)* lastAddress;
+
+        debug(DwarfDebugMachine) printf("program:\n");
+        runStateMachine(lp,
+            (const(void)* address, LocationInfo locInfo, bool isEndSequence)
+            {
+                // adjust to ASLR offset
+                address += baseAddress;
+                debug (DwarfDebugMachine)
+                    printf("-- offsetting %p to %p\n", address - baseAddress, address);
+
+                foreach (ref loc; locations)
+                {
+                    // If loc.line != -1, then it has been set previously.
+                    // Some implementations (eg. dmd) write an address to
+                    // the debug data multiple times, but so far I have found
+                    // that the first occurrence to be the correct one.
+                    if (loc.line != -1)
+                        continue;
+
+                    // Can be called with either `locInfo` or `lastLoc`
+                    void update(const ref LocationInfo match)
+                    {
+                        // File indices are 1-based for DWARF < 5
+                        const fileIndex = cast(size_t) match.file - (lp.dwarfVersion < 5 ? 1 : 0);
+                        if (fileIndex >= lp.sourceFiles.length)
+                            return;
+                        const sourceFile = lp.sourceFiles[fileIndex];
+                        debug (DwarfDebugMachine)
+                        {
+                            printf("-- found for [%p]:\n", loc.address);
+                            printf("--   file: %.*s\n",
+                                   cast(int) sourceFile.file.length, sourceFile.file.ptr);
+                            printf("--   line: %d\n", match.line);
+                        }
+                        // DMD emits entries with FQN, but other implementations
+                        // (e.g. LDC) make use of directories
+                        // See https://github.com/dlang/druntime/pull/2945
+                        if (sourceFile.dirIndex != 0 && sourceFile.dirIndex <= lp.includeDirectories.length)
+                            loc.directory = lp.includeDirectories[sourceFile.dirIndex - 1];
+
+                        // A relative path is relative to the compilation directory,
+                        // which is also the implicit directory for index 0 (DWARF < 5).
+                        // In DWARF 5, the compilation directory is directory 0 itself.
+                        const isAbsolute = sourceFile.file.length && sourceFile.file[0] == '/'
+                            || loc.directory.length && loc.directory[0] == '/';
+                        const isCompDir = lp.dwarfVersion >= 5 && sourceFile.dirIndex == 1;
+                        if (!isAbsolute && !isCompDir)
+                            loc.compilationDirectory = getCompilationDirectory();
+
+                        loc.file = sourceFile.file;
+                        loc.line = match.line;
+                        numberOfLocationsFound++;
+                    }
+
+                    // The state machine will not contain an entry for each
+                    // address, as consecutive addresses with the same file/line
+                    // are merged together to save on space, so we need to
+                    // check if our address is within two addresses we get
+                    // called with.
+                    //
+                    // Specs (DWARF v4, Section 6.2, PDF p.109) says:
+                    // "We shrink it with two techniques. First, we delete from
+                    // the matrix each row whose file, line, source column and
+                    // discriminator information is identical with that of its
+                    // predecessors.
+                    if (loc.address == address)
+                        update(locInfo);
+                    else if (lastAddress &&
+                             loc.address > lastAddress && loc.address < address)
+                        update(lastLoc);
+                }
+
+                if (isEndSequence)
+                {
+                    lastAddress = null;
+                }
+                else
+                {
+                    lastAddress = address;
+                    lastLoc = locInfo;
+                }
+
+                return numberOfLocationsFound < locations.length;
+            }
+        );
+
+        if (numberOfLocationsFound == locations.length) return;
+    }
+}
+
+/**
+ * A callback type for `runStateMachine`
+ *
+ * The callback is called when certain specific opcode are encountered
+ * (a.k.a when a complete `LocationInfo` is encountered).
+ * See `runStateMachine` implementation and the DWARF specs for more detail.
+ *
+ * Params:
+ *   address = The address that the `LocationInfo` describes
+ *   info = The `LocationInfo` itself, describing `address`
+ *   isEndSequence = Whether the end of a sequence has been reached
+ */
+alias RunStateMachineCallback =
+    bool delegate(const(void)* address, LocationInfo info, bool isEndSequence)
+    @nogc nothrow;
+
+/**
+ * Run the state machine to generate line number matrix
+ *
+ * Line number informations generated by the compiler are stored in the
+ * `.debug_line` section. Conceptually, they can be seen as a large matrix,
+ * with row such as "file", "line", "column", "is_statement", etc...
+ * However such a matrix would be too big to store in an object file,
+ * so DWARF instead generate this matrix using bytecode fed to a state machine.
+ *
+ * Note:
+ * Each compilation unit can have its own line number program.
+ *
+ * See_Also:
+ * - DWARF v4, Section 6.2: Line Number Information
+ *
+ * Params:
+ *   lp = Program to execute
+ *   callback = Delegate to call whenever a LocationInfo is completed
+ *
+ * Returns:
+ *   `false` if an error happened (e.g. unknown opcode)
+ */
+bool runStateMachine(ref const(LineNumberProgram) lp, scope RunStateMachineCallback callback) @nogc nothrow
+{
+    StateMachine machine;
+    machine.isStatement = lp.defaultIsStatement;
+
+    const(ubyte)[] program = lp.program;
+    while (program.length > 0)
+    {
+        size_t advanceAddressAndOpIndex(size_t operationAdvance)
+        {
+            const addressIncrement = lp.minimumInstructionLength * ((machine.operationIndex + operationAdvance) / lp.maximumOperationsPerInstruction);
+            machine.address += addressIncrement;
+            machine.operationIndex = (machine.operationIndex + operationAdvance) % lp.maximumOperationsPerInstruction;
+            return addressIncrement;
+        }
+
+        ubyte opcode = program.read!ubyte();
+        if (opcode < lp.opcodeBase)
+        {
+            switch (opcode) with (DW_LNS)
+            {
+                case extendedOp:
+                    size_t len = cast(size_t) program.readULEB128();
+                    ubyte eopcode = program.read!ubyte();
+
+                    switch (eopcode) with (DW_LNE)
+                    {
+                        case endSequence:
+                            machine.isEndSequence = true;
+                            debug(DwarfDebugMachine) printf("endSequence %p\n", machine.address);
+                            if (!callback(machine.address, LocationInfo(machine.fileIndex, machine.line), true)) return true;
+                            machine = StateMachine.init;
+                            machine.isStatement = lp.defaultIsStatement;
+                            break;
+
+                        case setAddress:
+                            const address = program.read!(void*)();
+                            debug(DwarfDebugMachine) printf("setAddress %p\n", address);
+                            machine.address = address;
+                            machine.operationIndex = 0;
+                            break;
+
+                        case defineFile: // TODO: add proper implementation
+                            debug(DwarfDebugMachine) printf("defineFile\n");
+                            program = program[len - 1 .. $];
+                            break;
+
+                        case setDiscriminator:
+                            const discriminator = cast(uint) program.readULEB128();
+                            debug(DwarfDebugMachine) printf("setDiscriminator %d\n", discriminator);
+                            machine.discriminator = discriminator;
+                            break;
+
+                        default:
+                            // unknown opcode
+                            debug(DwarfDebugMachine) printf("unknown extended opcode %d\n", cast(int) eopcode);
+                            program = program[len - 1 .. $];
+                            break;
+                    }
+
+                    break;
+
+                case copy:
+                    debug(DwarfDebugMachine) printf("copy %p\n", machine.address);
+                    if (!callback(machine.address, LocationInfo(machine.fileIndex, machine.line), false)) return true;
+                    machine.isBasicBlock = false;
+                    machine.isPrologueEnd = false;
+                    machine.isEpilogueBegin = false;
+                    machine.discriminator = 0;
+                    break;
+
+                case advancePC:
+                    const operationAdvance = cast(size_t) readULEB128(program);
+                    advanceAddressAndOpIndex(operationAdvance);
+                    debug(DwarfDebugMachine) printf("advancePC %d to %p\n", cast(int) operationAdvance, machine.address);
+                    break;
+
+                case advanceLine:
+                    long ad = readSLEB128(program);
+                    machine.line += ad;
+                    debug(DwarfDebugMachine) printf("advanceLine %d to %d\n", cast(int) ad, cast(int) machine.line);
+                    break;
+
+                case setFile:
+                    uint index = cast(uint) readULEB128(program);
+                    debug(DwarfDebugMachine) printf("setFile to %d\n", cast(int) index);
+                    machine.fileIndex = index;
+                    break;
+
+                case setColumn:
+                    uint col = cast(uint) readULEB128(program);
+                    debug(DwarfDebugMachine) printf("setColumn %d\n", cast(int) col);
+                    machine.column = col;
+                    break;
+
+                case negateStatement:
+                    debug(DwarfDebugMachine) printf("negateStatement\n");
+                    machine.isStatement = !machine.isStatement;
+                    break;
+
+                case setBasicBlock:
+                    debug(DwarfDebugMachine) printf("setBasicBlock\n");
+                    machine.isBasicBlock = true;
+                    break;
+
+                case constAddPC:
+                    const operationAdvance = (255 - lp.opcodeBase) / lp.lineRange;
+                    advanceAddressAndOpIndex(operationAdvance);
+                    debug(DwarfDebugMachine) printf("constAddPC %p\n", machine.address);
+                    break;
+
+                case fixedAdvancePC:
+                    const add = program.read!ushort();
+                    machine.address += add;
+                    machine.operationIndex = 0;
+                    debug(DwarfDebugMachine) printf("fixedAdvancePC %d to %p\n", cast(int) add, machine.address);
+                    break;
+
+                case setPrologueEnd:
+                    machine.isPrologueEnd = true;
+                    debug(DwarfDebugMachine) printf("setPrologueEnd\n");
+                    break;
+
+                case setEpilogueBegin:
+                    machine.isEpilogueBegin = true;
+                    debug(DwarfDebugMachine) printf("setEpilogueBegin\n");
+                    break;
+
+                case setISA:
+                    machine.isa = cast(uint) readULEB128(program);
+                    debug(DwarfDebugMachine) printf("setISA %d\n", cast(int) machine.isa);
+                    break;
+
+                default:
+                    debug(DwarfDebugMachine) printf("unknown opcode %d\n", cast(int) opcode);
+                    return false;
+            }
+        }
+        else
+        {
+            opcode -= lp.opcodeBase;
+            const operationAdvance = opcode / lp.lineRange;
+            const addressIncrement = advanceAddressAndOpIndex(operationAdvance);
+            const lineIncrement = lp.lineBase + (opcode % lp.lineRange);
+            machine.line += lineIncrement;
+
+            debug (DwarfDebugMachine)
+                printf("special %d %d to %p line %d\n", cast(int) addressIncrement,
+                       cast(int) lineIncrement, machine.address, machine.line);
+
+            if (!callback(machine.address, LocationInfo(machine.fileIndex, machine.line), false)) return true;
+
+            machine.isBasicBlock = false;
+            machine.isPrologueEnd = false;
+            machine.isEpilogueBegin = false;
+            machine.discriminator = 0;
+        }
+    }
+
+    return true;
+}
+
+T read(T)(ref const(ubyte)[] buffer) @nogc nothrow
+{
+    version (X86)         enum hasUnalignedLoads = true;
+    else version (X86_64) enum hasUnalignedLoads = true;
+    else                  enum hasUnalignedLoads = false;
+
+    static if (hasUnalignedLoads || T.alignof == 1)
+    {
+        T result = *(cast(T*) buffer.ptr);
+    }
+    else
+    {
+        T result = void;
+        memcpy(&result, buffer.ptr, T.sizeof);
+    }
+
+    buffer = buffer[T.sizeof .. $];
+    return result;
+}
+
+// Reads a null-terminated string from `buffer`.
+const(char)[] readStringz(ref const(ubyte)[] buffer) @nogc nothrow
+{
+    const p = cast(char*) buffer.ptr;
+    const str = p[0 .. strlen(p)];
+    buffer = buffer[str.length+1 .. $];
+    return str;
+}
+
+ulong readULEB128(ref const(ubyte)[] buffer) @nogc nothrow
+{
+    ulong val = 0;
+    uint shift = 0;
+
+    while (true)
+    {
+        ubyte b = buffer.read!ubyte();
+
+        val |= (b & 0x7f) << shift;
+        if ((b & 0x80) == 0) break;
+        shift += 7;
+    }
+
+    return val;
+}
+
+unittest
+{
+    const(ubyte)[] data = [0xe5, 0x8e, 0x26, 0xDE, 0xAD, 0xBE, 0xEF];
+    assert(readULEB128(data) == 624_485);
+    assert(data[] == [0xDE, 0xAD, 0xBE, 0xEF]);
+}
+
+long readSLEB128(ref const(ubyte)[] buffer) @nogc nothrow
+{
+    long val = 0;
+    uint shift = 0;
+    int size = 8 << 3;
+    ubyte b;
+
+    while (true)
+    {
+        b = buffer.read!ubyte();
+        val |= (b & 0x7f) << shift;
+        shift += 7;
+        if ((b & 0x80) == 0)
+            break;
+    }
+
+    if (shift < size && (b & 0x40) != 0)
+        val |= -(1 << shift);
+
+    return val;
+}
+
+enum DW_LNCT : ushort
+{
+    path = 1,
+    directoryIndex = 2,
+    timestamp = 3,
+    size = 4,
+    md5 = 5,
+    loUser = 0x2000,
+    hiUser = 0x3fff,
+}
+
+/// Attribute forms defined by the DWARF debugging information format.
+///
+/// The form determines how an attribute value is encoded in DWARF data.
+enum DW_FORM : ubyte
+{
+    /// An address-sized value (unsigned integer in the target's address size)
+    addr = 1,
+    /// A 2-byte byte count followed by that many bytes
+    block2 = 3,
+    /// A 4-byte byte count followed by that many bytes
+    block4 = 4,
+    /// A 2-byte unsigned constant
+    data2 = 5,
+    /// A 4-byte unsigned constant
+    data4 = 6,
+    /// An 8-byte unsigned constant
+    data8 = 7,
+    /// An inline null-terminated string
+    string_ = 8,
+    /// An unsigned LEB128 byte count followed by that many bytes
+    block = 9,
+    /// A 1-byte byte count followed by that many bytes
+    block1 = 10,
+    /// A 1-byte unsigned constant
+    data1 = 11,
+    /// A 1-byte flag
+    flag = 12,
+    /// A signed LEB128 constant
+    sdata = 13,
+    /// A 4- or 8-byte offset into the .debug_str section
+    strp = 14,
+    /// An unsigned LEB128 constant
+    udata = 15,
+    /// A 4- or 8-byte offset into the .debug_info section
+    ref_addr = 16,
+    /// A 1-byte offset from the start of the containing compilation unit
+    ref1 = 17,
+    /// A 2-byte offset from the start of the containing compilation unit
+    ref2 = 18,
+    /// A 4-byte offset from the start of the containing compilation unit
+    ref4 = 19,
+    /// An 8-byte offset from the start of the containing compilation unit
+    ref8 = 20,
+    /// An unsigned LEB128 offset from the start of the containing compilation unit
+    ref_udata = 21,
+    /// An unsigned LEB128 form code followed by a value in that form
+    indirect = 22,
+    /// A 4- or 8-byte offset into the applicable debug section - Introduced in DWARF4
+    sec_offset = 23,
+    /// An unsigned LEB128 byte count followed by a DWARF expression or location description - Introduced in DWARF4
+    exprloc = 24,
+    /// A flag that is implicitly true and consumes no bytes - Introduced in DWARF4
+    flag_present = 25,
+    /// An unsigned LEB128 index into a table of offsets in the .debug_str_offsets section - Introduced in DWARF5
+    strx = 26,
+    /// An unsigned LEB128 index into a table of addresses in the .debug_addr section - Introduced in DWARF5
+    addrx = 27,
+    /// A 4-byte offset into the .debug_info section of a supplementary object file - Introduced in DWARF5
+    ref_sup4 = 28,
+    /// A 4- or 8-byte offset into the .debug_str section of a supplementary object file - Introduced in DWARF5
+    strp_sup = 29,
+    /// A 16-byte constant - Introduced in DWARF5
+    data16 = 30,
+    /// A 4- or 8-byte offset into the .debug_line_str section - Introduced in DWARF5
+    line_strp = 31,
+    /// An 8-byte type signature - Introduced in DWARF4
+    ref_sig8 = 32,
+    /// A signed LEB128 constant stored in the abbreviation declaration rather than the attribute value - Introduced in DWARF5
+    implicit_const = 33,
+    /// An unsigned LEB128 index into a table of offsets in the .debug_loclists section - Introduced in DWARF5
+    loclistx = 34,
+    /// An unsigned LEB128 index into a table of offsets in the .debug_rnglists section - Introduced in DWARF5
+    rnglistx = 35,
+    /// An 8-byte offset into the .debug_info section of a supplementary object file - Introduced in DWARF5
+    ref_sup8 = 36,
+    /// A 1-byte unsigned index into a table of offsets in the .debug_str_offsets section - Introduced in DWARF5
+    strx1 = 37,
+    /// A 2-byte unsigned index into a table of offsets in the .debug_str_offsets section - Introduced in DWARF5
+    strx2 = 38,
+    /// A 3-byte unsigned index into a table of offsets in the .debug_str_offsets section - Introduced in DWARF5
+    strx3 = 39,
+    /// A 4-byte unsigned index into a table of offsets in the .debug_str_offsets section - Introduced in DWARF5
+    strx4 = 40,
+    /// A 1-byte unsigned index into a table of addresses in the .debug_addr section - Introduced in DWARF5
+    addrx1 = 41,
+    /// A 2-byte unsigned index into a table of addresses in the .debug_addr section - Introduced in DWARF5
+    addrx2 = 42,
+    /// A 3-byte unsigned index into a table of addresses in the .debug_addr section - Introduced in DWARF5
+    addrx3 = 43,
+    /// A 4-byte unsigned index into a table of addresses in the .debug_addr section - Introduced in DWARF5
+    addrx4 = 44,
+}
+
+struct EntryFormatPair
+{
+    DW_LNCT type;
+    DW_FORM form;
+}
+
+/// Reads a DWARF v5 directory/file name entry format.
+Array!EntryFormatPair readEntryFormat(ref const(ubyte)[] buffer) @nogc nothrow
+{
+    const numPairs = buffer.read!ubyte();
+
+    Array!EntryFormatPair pairs;
+    pairs.length = numPairs;
+
+    foreach (ref pair; pairs)
+    {
+        pair.type = cast(DW_LNCT) buffer.readULEB128();
+        pair.form = cast(DW_FORM) buffer.readULEB128();
+    }
+
+    debug (DwarfDebugMachine)
+    {
+        printf("entryFormat: (%d)\n", cast(int) pairs.length);
+        foreach (ref pair; pairs)
+            printf("\t- type: %d, form: %d\n", cast(int) pair.type, cast(int) pair.form);
+    }
+
+    return pairs;
+}
+
+/**
+ * Skips over an attribute value encoded with `form`
+ *
+ * Params:
+ *   data = Buffer to read from, advanced past the value
+ *   form = The form the value is encoded with
+ *   is64bitDwarf = Whether the unit uses the 64-bit DWARF format
+ *   addressSize = Size of an address in the unit
+ *
+ * Returns:
+ *   `false` if `form` is unknown, in which case `data` is left untouched
+ */
+bool skipForm(ref const(ubyte)[] data, DW_FORM form, bool is64bitDwarf, ubyte addressSize) @nogc nothrow
+{
+    with (DW_FORM) switch (form)
+    {
+        case flag_present, implicit_const:
+            break;
+        case data1, ref1, flag, strx1, addrx1:
+            data = data[1 .. $]; break;
+        case data2, ref2, strx2, addrx2:
+            data = data[2 .. $]; break;
+        case strx3, addrx3:
+            data = data[3 .. $]; break;
+        case data4, ref4, ref_sup4, strx4, addrx4:
+            data = data[4 .. $]; break;
+        case data8, ref8, ref_sig8, ref_sup8:
+            data = data[8 .. $]; break;
+        case data16:
+            data = data[16 .. $]; break;
+        case addr:
+            data = data[addressSize .. $]; break;
+        case strp, strp_sup, line_strp, sec_offset, ref_addr:
+            data = data[is64bitDwarf ? 8 : 4 .. $]; break;
+        case udata, ref_udata, strx, addrx, loclistx, rnglistx:
+            data.readULEB128(); break;
+        case sdata:
+            data.readSLEB128(); break;
+        case string_:
+            data.readStringz(); break;
+        case block1:
+            const length = data.read!ubyte();
+            data = data[length .. $];
+            break;
+        case block2:
+            const length = data.read!ushort();
+            data = data[length .. $];
+            break;
+        case block4:
+            const length = data.read!uint();
+            data = data[length .. $];
+            break;
+        case block, exprloc:
+            const length = cast(size_t) data.readULEB128();
+            data = data[length .. $];
+            break;
+        case indirect:
+            auto copy = data;
+            const actualForm = cast(DW_FORM) copy.readULEB128();
+            if (!skipForm(copy, actualForm, is64bitDwarf, addressSize))
+                return false;
+            data = copy;
+            break;
+        default:
+            return false;
+    }
+    return true;
+}
+
+/**
+ * Reads a string attribute value encoded with `form`
+ *
+ * Only forms that do not require additional context
+ * (such as `DW_AT_str_offsets_base` for `DW_FORM_strx`) are supported.
+ *
+ * Returns:
+ *   The string, or `null` if `form` is not supported
+ *   (`data` is still advanced past the value if the form is known).
+ */
+const(char)[] readStringForm(ref const(ubyte)[] data, DW_FORM form, bool is64bitDwarf,
+                             ref const DebugSections sections) @nogc nothrow
+{
+    switch (form) with (DW_FORM)
+    {
+        case string_:
+            return data.readStringz();
+        case strp, line_strp:
+            const offset = cast(size_t) (is64bitDwarf ? data.read!ulong() : data.read!uint());
+            return readStringAt(form == strp ? sections.str : sections.lineStr, offset);
+        default:
+            skipForm(data, form, is64bitDwarf, size_t.sizeof);
+            return null;
+    }
+}
+
+/// Reads a null-terminated string at `offset` in `section`, or `null` if out of bounds
+const(char)[] readStringAt(const(ubyte)[] section, size_t offset) @nogc nothrow
+{
+    if (offset >= section.length)
+        return null;
+    const str = cast(const(char)[]) section[offset .. $];
+    foreach (i, c; str)
+        if (c == '\0')
+            return str[0 .. i];
+    return null;
+}
+
+enum DW_TAG : ushort
+{
+    compile_unit = 0x11,
+}
+
+enum DW_AT : ushort
+{
+    stmt_list = 0x10,
+    comp_dir = 0x1b,
+}
+
+enum DW_UT : ubyte
+{
+    compile = 1,
+    type = 2,
+    partial = 3,
+    skeleton = 4,
+    split_compile = 5,
+    split_type = 6,
+}
+
+/**
+ * Finds the compilation directory of the unit using a given line number program
+ *
+ * Iterates over the units in `.debug_info` to find the one whose
+ * `DW_AT_stmt_list` is `lineProgramOffset`, and returns its `DW_AT_comp_dir`.
+ *
+ * Params:
+ *   sections = The DWARF sections of the image
+ *   lineProgramOffset = Offset of the line number program in `.debug_line`
+ *
+ * Returns:
+ *   The compilation directory, or `null` if it could not be found
+ */
+const(char)[] findCompilationDirectory(ref const DebugSections sections, size_t lineProgramOffset) @nogc nothrow
+{
+    const(ubyte)[] info = sections.info;
+    while (info.length > 4)
+    {
+        bool is64bitDwarf = false;
+        ulong unitLength = info.read!uint();
+        if (unitLength == uint.max)
+        {
+            is64bitDwarf = true;
+            unitLength = info.read!ulong();
+        }
+        if (unitLength > info.length)
+            return null;
+
+        auto unit = info[0 .. cast(size_t) unitLength];
+        info = info[cast(size_t) unitLength .. $];
+
+        const unitVersion = unit.read!ushort();
+        if (unitVersion < 2 || unitVersion > 5)
+            continue;
+
+        ubyte unitType = DW_UT.compile;
+        ubyte addressSize;
+        ulong abbrevOffset;
+        if (unitVersion >= 5)
+        {
+            unitType = unit.read!ubyte();
+            addressSize = unit.read!ubyte();
+            abbrevOffset = is64bitDwarf ? unit.read!ulong() : unit.read!uint();
+            if (unitType == DW_UT.skeleton || unitType == DW_UT.split_compile)
+                unit = unit[8 .. $]; // dwo_id
+            else if (unitType == DW_UT.type || unitType == DW_UT.split_type)
+                continue;
+        }
+        else
+        {
+            abbrevOffset = is64bitDwarf ? unit.read!ulong() : unit.read!uint();
+            addressSize = unit.read!ubyte();
+        }
+
+        if (abbrevOffset >= sections.abbrev.length)
+            continue;
+
+        // The unit's first DIE is the one we're interested in
+        const abbrevCode = unit.readULEB128();
+        if (abbrevCode == 0)
+            continue;
+
+        // Find the matching abbreviation declaration
+        const(ubyte)[] abbrev = sections.abbrev[cast(size_t) abbrevOffset .. $];
+        bool found;
+        while (abbrev.length)
+        {
+            const code = abbrev.readULEB128();
+            if (code == 0)
+                break;
+            if (code == abbrevCode)
+            {
+                found = true;
+                break;
+            }
+            // Skip this declaration: tag, has_children, and attribute specs
+            abbrev.readULEB128();
+            abbrev.read!ubyte();
+            while (true)
+            {
+                const attr = abbrev.readULEB128();
+                const form = abbrev.readULEB128();
+                if (form == DW_FORM.implicit_const)
+                    abbrev.readSLEB128();
+                if (attr == 0 && form == 0)
+                    break;
+            }
+        }
+        if (!found)
+            continue;
+
+        const tag = abbrev.readULEB128();
+        abbrev.read!ubyte(); // has_children
+        if (tag != DW_TAG.compile_unit)
+            continue;
+
+        const(char)[] compDir;
+        bool hasStmtList;
+        ulong stmtList;
+        while (true)
+        {
+            const attr = abbrev.readULEB128();
+            const form = cast(DW_FORM) abbrev.readULEB128();
+            if (form == DW_FORM.implicit_const)
+                abbrev.readSLEB128();
+            if (attr == 0 && form == 0)
+                break;
+
+            if (attr == DW_AT.stmt_list)
+            {
+                hasStmtList = true;
+                if (form == DW_FORM.sec_offset)
+                    stmtList = is64bitDwarf ? unit.read!ulong() : unit.read!uint();
+                else if (form == DW_FORM.data4)
+                    stmtList = unit.read!uint();
+                else if (form == DW_FORM.data8)
+                    stmtList = unit.read!ulong();
+                else
+                    break;
+            }
+            else if (attr == DW_AT.comp_dir)
+                compDir = readStringForm(unit, form, is64bitDwarf, sections);
+            else if (!skipForm(unit, form, is64bitDwarf, addressSize))
+                break;
+        }
+
+        if (hasStmtList && stmtList == lineProgramOffset)
+            return compDir;
+    }
+    return null;
+}
+
+/// Standard opcodes of the line number program.
+///
+/// Standard opcodes occupy the range `[1, opcode_base)`, where `opcode_base`
+/// comes from the line number program header. Opcodes at or above it are
+/// special opcodes, which are not enumerated here.
+///
+/// See_Also: DWARF v5, Section 6.2.5.2: Standard Opcodes
+enum DW_LNS : ubyte
+{
+    /// Not a standard opcode: introduces an extended opcode (see `DW_LNE`)
+    extendedOp = 0,
+    /// Append a row to the matrix, then reset `discriminator`,
+    /// `basic_block`, `prologue_end` and `epilogue_begin`
+    copy = 1,
+    /// Advance `address` and `op_index` by a ULEB128 operation advance
+    advancePC = 2,
+    /// Advance `line` by a SLEB128 operand
+    advanceLine = 3,
+    /// Set `file` to a ULEB128 operand, an index into the `file_names`
+    /// table of the header - 1-based before DWARF5, 0-based since
+    setFile = 4,
+    /// Set `column` to a ULEB128 operand
+    setColumn = 5,
+    /// Toggle `is_stmt`
+    negateStatement = 6,
+    /// Set `basic_block` to `true`
+    setBasicBlock = 7,
+    /// Advance `address` and `op_index` as special opcode 255 would,
+    /// without changing `line` or appending a row
+    constAddPC = 8,
+    /// Advance `address` by a 2-byte unsigned operand, not scaled by
+    /// `minimum_instruction_length`, and set `op_index` to 0
+    fixedAdvancePC = 9,
+    /// Set `prologue_end` to `true`
+    setPrologueEnd = 10,
+    /// Set `epilogue_begin` to `true`
+    setEpilogueBegin = 11,
+    /// Set `isa` to a ULEB128 operand
+    setISA = 12,
+}
+
+/// Extended opcodes of the line number program.
+///
+/// An extended opcode is encoded as a `0` byte, followed by a ULEB128 length,
+/// followed by the extended opcode itself and its operands. The length covers
+/// the extended opcode and its operands, so unknown opcodes can be skipped.
+///
+/// See_Also: DWARF v5, Section 6.2.5.3: Extended Opcodes
+enum DW_LNE : ubyte
+{
+    /// Set `end_sequence` to `true`, append a row to the matrix,
+    /// then reset all registers to their initial values
+    endSequence = 1,
+    /// Set `address` to a target-address-sized operand and `op_index` to 0
+    setAddress = 2,
+    /// Define an additional source file, using the same encoding as the
+    /// `file_names` entries of the header - Reserved since DWARF5
+    defineFile = 3,
+    /// Set `discriminator` to a ULEB128 operand - Introduced in DWARF4
+    setDiscriminator = 4,
+    /// First value of the range reserved for vendor extensions
+    loUser = 0x80,
+    /// Last value of the range reserved for vendor extensions
+    hiUser = 0xff,
+}
+
+struct StateMachine
+{
+    const(void)* address;
+    uint operationIndex = 0;
+    uint fileIndex = 1;
+    uint line = 1;
+    uint column = 0;
+    uint isa = 0;
+    uint discriminator = 0;
+    bool isStatement;
+    bool isBasicBlock = false;
+    bool isEndSequence = false;
+    bool isPrologueEnd = false;
+    bool isEpilogueBegin = false;
+}
+
+struct LocationInfo
+{
+    int file;
+    int line;
+}
+
+struct LineNumberProgram
+{
+    size_t offset; // offset of this program in `.debug_line`
+    ulong unitLength;
+    ushort dwarfVersion;
+    ubyte addressSize;
+    ubyte segmentSelectorSize;
+    ulong headerLength;
+    ubyte minimumInstructionLength;
+    ubyte maximumOperationsPerInstruction;
+    bool defaultIsStatement;
+    byte lineBase;
+    ubyte lineRange;
+    ubyte opcodeBase;
+    const(ubyte)[] standardOpcodeLengths;
+    Array!(const(char)[]) includeDirectories;
+    Array!SourceFile sourceFiles;
+    const(ubyte)[] program;
+}
+
+struct SourceFile
+{
+    const(char)[] file;
+    size_t dirIndex; // 1-based
+}
+
+/// Reads the DWARF 5 directory and file entries into `lp`.
+void readEntries(ref const(ubyte)[] data, ref LineNumberProgram lp, bool is64bitDwarf,
+                 ref const DebugSections sections) @nogc nothrow
+{
+    // Entries that can't be parsed (e.g. due to an unknown form) keep
+    // their fallback value, the program start is known from the header.
+    const dirFormat = data.readEntryFormat();
+    lp.includeDirectories.length = cast(size_t) data.readULEB128();
+    foreach (ref dir; lp.includeDirectories)
+        dir = "<unknown dir>"; // fallback
+    foreach (ref dir; lp.includeDirectories)
+    {
+        foreach (ref pair; dirFormat)
+        {
+            if (pair.type == DW_LNCT.path)
+            {
+                if (auto path = data.readStringForm(pair.form, is64bitDwarf, sections))
+                    dir = path;
+            }
+            else if (!data.skipForm(pair.form, is64bitDwarf, lp.addressSize))
+                return; // unknown form, can't parse further
+        }
+    }
+
+    const fileFormat = data.readEntryFormat();
+    lp.sourceFiles.length = cast(size_t) data.readULEB128();
+    foreach (ref sf; lp.sourceFiles)
+        sf.file = "<unknown file>"; // fallback
+    foreach (ref sf; lp.sourceFiles)
+    {
+        foreach (ref pair; fileFormat)
+        {
+            if (pair.type == DW_LNCT.path)
+            {
+                if (auto path = data.readStringForm(pair.form, is64bitDwarf, sections))
+                    sf.file = path;
+            }
+            else if (pair.type == DW_LNCT.directoryIndex)
+            {
+                if (pair.form == DW_FORM.data1)
+                    sf.dirIndex = data.read!ubyte();
+                else if (pair.form == DW_FORM.data2)
+                    sf.dirIndex = data.read!ushort();
+                else if (pair.form == DW_FORM.udata)
+                    sf.dirIndex = cast(size_t) data.readULEB128();
+                else
+                    return; // not allowed by DWARF 5 spec
+                sf.dirIndex++; // DWARF v5 indices are 0-based
+            }
+            else if (!data.skipForm(pair.form, is64bitDwarf, lp.addressSize))
+                return; // unknown form, can't parse further
+        }
+    }
+}
+
+LineNumberProgram readLineNumberProgram(ref const(ubyte)[] data, ref const DebugSections sections) @nogc nothrow
+{
+    const originalData = data;
+
+    LineNumberProgram lp;
+    lp.offset = cast(size_t) (data.ptr - sections.line.ptr);
+
+    bool is64bitDwarf = false;
+    lp.unitLength = data.read!uint();
+    if (lp.unitLength == uint.max)
+    {
+        is64bitDwarf = true;
+        lp.unitLength = data.read!ulong();
+    }
+
+    const dwarfVersionFieldOffset = cast(size_t) (data.ptr - originalData.ptr);
+    lp.dwarfVersion = data.read!ushort();
+    assert(lp.dwarfVersion < 6, "DWARF v6+ not supported yet");
+
+    if (lp.dwarfVersion >= 5)
+    {
+        lp.addressSize = data.read!ubyte();
+        lp.segmentSelectorSize = data.read!ubyte();
+    }
+
+    lp.headerLength = (is64bitDwarf ? data.read!ulong() : data.read!uint());
+
+    const minimumInstructionLengthFieldOffset = cast(size_t) (data.ptr - originalData.ptr);
+    lp.minimumInstructionLength = data.read!ubyte();
+
+    lp.maximumOperationsPerInstruction = (lp.dwarfVersion >= 4 ? data.read!ubyte() : 1);
+    lp.defaultIsStatement = (data.read!ubyte() != 0);
+    lp.lineBase = data.read!byte();
+    lp.lineRange = data.read!ubyte();
+    lp.opcodeBase = data.read!ubyte();
+
+    lp.standardOpcodeLengths = data[0 .. lp.opcodeBase - 1];
+    data = data[lp.opcodeBase - 1 .. $];
+
+    if (lp.dwarfVersion >= 5)
+        readEntries(data, lp, is64bitDwarf, sections);
+    else
+    {
+        // A sequence ends with a null-byte.
+        static auto readSequence(alias ReadEntry)(ref const(ubyte)[] data)
+        {
+            alias ResultType = typeof(ReadEntry(data));
+
+            static size_t count(const(ubyte)[] data)
+            {
+                size_t count = 0;
+                while (data.length && data[0] != 0)
+                {
+                    ReadEntry(data);
+                    ++count;
+                }
+                return count;
+            }
+
+            const numEntries = count(data);
+
+            Array!ResultType result;
+            result.length = numEntries;
+
+            foreach (i; 0 .. numEntries)
+                result[i] = ReadEntry(data);
+
+            data = data[1 .. $]; // skip over sequence-terminating null
+
+            return result;
+        }
+
+        /// Directories are simply a sequence of NUL-terminated strings
+        static const(char)[] readIncludeDirectoryEntry(ref const(ubyte)[] data)
+        {
+            return data.readStringz();
+        }
+        lp.includeDirectories = readSequence!readIncludeDirectoryEntry(data);
+
+        static SourceFile readFileNameEntry(ref const(ubyte)[] data)
+        {
+            const file = data.readStringz();
+            const dirIndex = cast(size_t) data.readULEB128();
+            data.readULEB128(); // last mod
+            data.readULEB128(); // file len
+
+            return SourceFile(
+                file,
+                dirIndex,
+            );
+        }
+        lp.sourceFiles = readSequence!readFileNameEntry(data);
+    }
+
+    debug (DwarfDebugMachine)
+    {
+        printf("include_directories: (%d)\n", cast(int) lp.includeDirectories.length);
+        foreach (dir; lp.includeDirectories)
+            printf("\t- %.*s\n", cast(int) dir.length, dir.ptr);
+        printf("source_files: (%d)\n", cast(int) lp.sourceFiles.length);
+        foreach (ref sf; lp.sourceFiles)
+        {
+            if (sf.dirIndex > lp.includeDirectories.length)
+                printf("\t- Out of bound directory! (%zu): %.*s\n",
+                       sf.dirIndex, cast(int) sf.file.length, sf.file.ptr);
+            else if (sf.dirIndex > 0)
+            {
+                const dir = lp.includeDirectories[sf.dirIndex - 1];
+                printf("\t- (Dir:%zu:%.*s/)%.*s\n", sf.dirIndex,
+                       cast(int) dir.length, dir.ptr,
+                       cast(int) sf.file.length, sf.file.ptr);
+            }
+            else
+                printf("\t- %.*s\n", cast(int) sf.file.length, sf.file.ptr);
+        }
+    }
+
+    const programStart = cast(size_t) (minimumInstructionLengthFieldOffset + lp.headerLength);
+    const programEnd = cast(size_t) (dwarfVersionFieldOffset + lp.unitLength);
+    lp.program = originalData[programStart .. programEnd];
+
+    data = originalData[programEnd .. $];
+
+    return lp;
+}

@@ -1,0 +1,346 @@
+// https://issues.dlang.org/show_bug.cgi?id=23103
+// Issue 23103 - static initialization of associative arrays is not implemented
+
+nothrow @safe:
+
+/////////////////////////////////////////////
+
+int[int] globalAA = [1: 10, 2: 20];
+
+void testSimple()
+{
+    assert(globalAA[1] == 10);
+    assert(globalAA[2] == 20);
+    assert(!(30 in globalAA));
+
+    foreach (i; 0 .. 1000)
+    {
+        globalAA[i] = i * 10;
+        assert(globalAA[i] == i * 10);
+    }
+}
+
+/////////////////////////////////////////////
+
+struct Composit
+{
+    string[string][] aa;
+}
+
+auto getAA() { return ["a": "A"]; }
+
+immutable Composit compositAA = Composit([getAA(), ["b": "B"]]);
+
+void testComposit() pure
+{
+    assert(compositAA.aa[0]["a"] == "A");
+    assert(compositAA.aa[1]["b"] == "B");
+}
+
+/////////////////////////////////////////////
+
+struct Destructing
+{
+    int v;
+    static int destructorsCalled = 0;
+
+    ~this() nothrow
+    {
+        // FIXME: the lowering to newaa calls the destructor at CTFE, so we can't modify globals in it
+        if (!__ctfe)
+            destructorsCalled++;
+    }
+}
+
+struct Key
+{
+    int v;
+    bool opEquals(ref const Key o) const { return v == o.v; }
+    size_t toHash() const nothrow { return v; }
+}
+
+Destructing[Key] dAa = [Key(1): Destructing(10), Key(2): Destructing(20)];
+
+void testDestructor()
+{
+    assert(dAa[Key(1)].v == 10);
+    assert(dAa[Key(2)].v == 20);
+    assert(Destructing.destructorsCalled == 0);
+    dAa[Key(1)] = Destructing(100);
+    assert(dAa[Key(1)].v == 100);
+    assert(Destructing.destructorsCalled == 1);
+}
+
+/////////////////////////////////////////////
+
+enum A
+{
+    x, y, z
+}
+
+struct S
+{
+    string[A] t = [A.x : "A.x", A.y : "A.y"];
+}
+
+void testStructInit()
+{
+    S s;
+    assert(s.t[A.x] == "A.x");
+    assert(s.t[A.y] == "A.y");
+}
+
+struct S2
+{
+    string[A] t = [A.x : "A.x", A.y : "A.y"];
+}
+
+bool testStructInitCTFE()
+{
+    S2 s2;
+    assert(s2.t[A.x] == "A.x");
+    assert(s2.t[A.y] == "A.y");
+    return true;
+}
+static assert(testStructInitCTFE());
+
+/////////////////////////////////////////////
+
+class C
+{
+    string[int] t = [0 : "zero"];
+}
+
+void testClassInit()
+{
+    C c = new C();
+    assert(c.t[0] == "zero");
+}
+
+class C2
+{
+    string[int] t = [0 : "zero"];
+}
+
+bool testClassInitCTFE()
+{
+    C2 c2 = new C2();
+    assert(c2.t[0] == "zero");
+    return true;
+}
+static assert(testClassInitCTFE());
+
+/////////////////////////////////////////////
+
+immutable(string)[immutable(int)] immutableAA = [1: "one", 2: "two"];
+
+void testImmutable()
+{
+    assert(immutableAA[1] == "one");
+    assert(immutableAA[2] == "two");
+}
+
+/////////////////////////////////////////////
+
+// https://issues.dlang.org/show_bug.cgi?id=24209
+void testLocalStatic() @trusted
+{
+    static int[int] aa0 = [1: 2];
+    __gshared string[string] aa1 = null;
+
+    assert(aa0[1] == 2);
+    assert(aa1.length == 0);
+}
+
+/////////////////////////////////////////////
+
+// https://issues.dlang.org/show_bug.cgi?id=24311
+enum E : int[int] { x = [123: 456] }
+
+void testEnumInit()
+{
+    E e = E.init;
+    assert(e[123] == 456);
+    auto aa = new E;
+}
+
+/////////////////////////////////////////////
+
+// https://issues.dlang.org/show_bug.cgi?id=24370
+immutable uint[3][string] test = [
+    "oneTwoThree": [1,2,3],
+    "fourFiveSix": [4,5,6],
+    "sevenEightNine": [7,8,9],
+];
+
+void testStaticArray()
+{
+    assert(test["oneTwoThree"] == [1, 2, 3]);
+    assert(test["fourFiveSix"] == [4, 5, 6]);
+    assert(test["sevenEightNine"] == [7, 8, 9]);
+}
+
+/////////////////////////////////////////////
+
+// https://issues.dlang.org/show_bug.cgi?id=24602
+
+class Set
+{
+    bool[string] aa;
+
+    this(bool[string] aa)
+    {
+        this.aa = aa;
+    }
+}
+
+class Bar
+{
+    Set x = new Set(["a": 1, "b": 0]);
+}
+
+void testClassLiteral()
+{
+    assert(new Bar().x.aa["a"] == 1);
+    assert(new Bar().x.aa["b"] == 0);
+}
+
+/////////////////////////////////////////////
+
+// https://github.com/dlang/dmd/issues/21690
+void testMultiDim()
+{
+    int[int][int] aa1 = [ 1: [2: 3] ]; // Error: invalid value `[2:3]` in initializer (see #17804)
+    int[int][int] aa2 = ([ 1: [2: 3] ]); // workaround
+    auto aa3 = [ 1: [2: 3] ]; // works, too
+    static auto aa4 = [ 1: [2: 3] ]; // Error: internal compiler error: failed to detect static initialization of associative array
+    assert(aa1 == aa2);
+    assert(aa2 == aa3);
+    assert(aa3 == aa4);
+}
+
+// from https://github.com/dlang/dmd/issues/20542
+void testRegression21773()
+{
+    static struct S
+    {
+        int[string] aa;
+        this(int[string] _aa) { aa = _aa; }
+    }
+
+    S[] aa = [
+        ["x": 1, "y": 2],
+        ["x": 3, "y": 4],
+        ["x": 5, "y": 6],
+    ];
+
+    // test we did not break initialization of static array from lower dimension
+    static int[3][4] a2 = [ 1, 2, 3, 4 ]; // only works with static initializer !?
+    int[3][4] a3 = [ [1, 1, 1], [2, 2, 2], [3, 3, 3], [4, 4, 4] ];
+    assert(a2 == a3);
+}
+
+// https://github.com/dlang/dmd/issues/23900
+void testIndexedNestedStaticArray()
+{
+    const int[3][2] color = [
+        1: [255, 0, 0],
+    ];
+    assert(color[0] == [0, 0, 0]);
+    assert(color[1] == [255, 0, 0]);
+
+    int[3][2] color2 = [
+        0: [255, 0, 0],
+        1: 7,
+    ];
+    assert(color2[0] == [255, 0, 0]);
+    assert(color2[1] == [7, 7, 7]);
+
+    int[2][3][4] cube = [
+        1: [ [1, 2], [3, 4], [5, 6] ],
+        2: 9,
+        3: [ 0: [7, 8] ],
+    ];
+    assert(cube[0] == [[0, 0], [0, 0], [0, 0]]);
+    assert(cube[1] == [[1, 2], [3, 4], [5, 6]]);
+    assert(cube[2] == [[9, 9], [9, 9], [9, 9]]);
+    assert(cube[3] == [[7, 8], [0, 0], [0, 0]]);
+}
+
+// https://github.com/dlang/dmd/issues/19209
+void test19209()
+{
+    int[int][] a = [[1 : 2]]; // ok
+    int[int][] b = [[0 : 2]]; // expression ([[1]]) of type int[][]
+    int[int][int] c = [1 : [0 : 2]]; // expression ([1:[2]]) of type int[][int]
+    int[int][int] d = [1 : [3 : 2]]; // Error: not an associative array initializer
+
+    enum int[][] x = [[2 : 0]]; // fails
+    static assert(x[0].length == 3);
+    enum int[][int] y = [1 : [2 : 1]]; // fails
+    static assert(y[1][2] == 1);
+
+    static assert(!__traits(compiles, { immutable int[7] z = [ 2 : 1, 4 : 2, 8 : 3 ]; })); // Error: mismatched array lengths, 7 and 9
+}
+
+// https://github.com/dlang/dmd/issues/18360
+void test18360()
+{
+    alias string[string][string] sss;
+    sss stat =
+    [
+        "one" : ["a":"A", "b":"B"],
+        "two" : ["d":"D", "e":"E"],
+    ];
+}
+
+/////////////////////////////////////////////
+
+// https://github.com/dlang/dmd/issues/17804
+void testMultiDimInit()
+{
+    static struct D
+    {
+        string[string][string] aa;
+        this(string[string][string] _aa) { aa = _aa; }
+    }
+    static struct S
+    {
+        //Error: not an associative array initializer
+        D a = ["fdsa": ["fdsafd": "fdsfa"]];
+
+        // OK
+        D b = (["fdsa": ["fdsafd": "fdsfa"]]);
+    }
+    immutable string[7] a = [
+        3 : null,
+        2 : "D",
+        1 : "C",
+    ];
+    static int[char][char] arr = ['A' : ['B': 0]]; // error
+    assert(arr.length == 1);
+    assert(arr['A'] == ['B':0]);
+
+    S s;
+    assert(s.a.aa["fdsa"]["fdsafd"] == "fdsfa");
+    assert(s.b.aa["fdsa"]["fdsafd"] == "fdsfa");
+}
+
+/////////////////////////////////////////////
+
+void main()
+{
+    testSimple();
+    testComposit();
+    testDestructor();
+    testStructInit();
+    testClassInit();
+    testImmutable();
+    testLocalStatic();
+    testEnumInit();
+    testStaticArray();
+    testClassLiteral();
+    testMultiDim();
+    testMultiDimInit();
+    testIndexedNestedStaticArray();
+}

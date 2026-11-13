@@ -1,0 +1,494 @@
+/**
+ * Pretty print data structures
+ *
+ * Compiler implementation of the
+ * $(LINK2 https://www.dlang.org, D programming language).
+ *
+ * Copyright:   Copyright (C) 1985-1998 by Symantec
+ *              Copyright (C) 2000-2026 by The D Language Foundation, All Rights Reserved
+ * Authors:     $(LINK2 https://www.digitalmars.com, Walter Bright)
+ * License:     $(LINK2 https://www.boost.org/LICENSE_1_0.txt, Boost License 1.0)
+ * Source:      $(LINK2 https://github.com/dlang/dmd/blob/master/compiler/src/dmd/backend/debugprint.d, backend/debugprint.d)
+ * Coverage:    https://codecov.io/gh/dlang/dmd/src/master/compiler/src/dmd/backend/debugprint.d
+ */
+
+module dmd.backend.debugprint;
+
+import core.stdc.stdio;
+import core.stdc.stdlib;
+import core.stdc.string;
+
+import dmd.backend.backconfig : debugf;
+import dmd.backend.cdef;
+import dmd.backend.cc;
+import dmd.backend.el;
+import dmd.backend.evalu8 : iftrue;
+import dmd.backend.code;
+import dmd.backend.x86.code_x86;
+import dmd.backend.go;
+import dmd.backend.oper;
+import dmd.backend.symbol;
+import dmd.backend.ty;
+import dmd.backend.type;
+
+import dmd.backend.dvec;
+
+
+nothrow:
+@safe:
+
+@trusted
+void ferr(const char* p) { printf("%s", p); }
+
+/*******************************
+ * Params:
+ *      c = storage class SC members
+ * Returns:
+ *      storage class string
+ */
+
+@trusted
+const(char)* class_str(SC c)
+{
+    return sc[c].ptr;
+}
+
+private immutable char[10][SC.max + 1] sc =
+[
+    SC.unde      : SC.unde     .stringof,
+    SC.auto_     : SC.auto_    .stringof,
+    SC.static_   : SC.static_  .stringof,
+    SC.extern_   : SC.extern_  .stringof,
+    SC.register  : SC.register .stringof,
+    SC.pseudo    : SC.pseudo   .stringof,
+    SC.global    : SC.global   .stringof,
+    SC.comdat    : SC.comdat   .stringof,
+    SC.parameter : SC.parameter.stringof,
+    SC.regpar    : SC.regpar   .stringof,
+    SC.fastpar   : SC.fastpar  .stringof,
+    SC.shadowreg : SC.shadowreg.stringof,
+    SC.typedef_  : SC.typedef_ .stringof,
+    SC.struct_   : SC.struct_  .stringof,
+    SC.enum_     : SC.enum_    .stringof,
+    SC.field     : SC.field    .stringof,
+    SC.const_    : SC.const_   .stringof,
+    SC.member    : SC.member   .stringof,
+    SC.inline    : SC.inline   .stringof,
+    SC.sinline   : SC.sinline  .stringof,
+    SC.einline   : SC.einline  .stringof,
+    SC.locstat   : SC.locstat  .stringof,
+    SC.comdef    : SC.comdef   .stringof,
+    SC.bprel     : SC.bprel    .stringof,
+    SC.alias_    : SC.alias_   .stringof,
+    SC.funcalias : SC.funcalias.stringof,
+    SC.stack     : SC.stack    .stringof,
+];
+
+/***************************
+ * Convert OPER to string.
+ * Params:
+ *      oper = operator number
+ * Returns:
+ *      pointer to string
+ */
+
+const(char)* oper_str(uint oper) pure
+{
+    assert(oper < OPMAX);
+    return &debtab[oper][0];
+}
+
+/*******************************
+ * Convert tym_t to string.
+ * Params:
+ *      ty = type number
+ * Returns:
+ *      pointer to malloc'd string
+ */
+@trusted
+const(char)* tym_str(tym_t ty)
+{
+    enum MAX = 100;
+    __gshared char[MAX + 1] buf;  // globals are not a threading issue with debug code
+
+    char* pstart = &buf[0];
+    char* p = pstart;
+    *p = 0;
+    if (ty & mTYnear)
+        strcat(p, "mTYnear|");
+    if (ty & mTYfar)
+        strcat(p, "mTYfar|");
+    if (ty & mTYcs)
+        strcat(p, "mTYcs|");
+    if (ty & mTYconst)
+        strcat(p, "mTYconst|");
+    if (ty & mTYvolatile)
+        strcat(p, "mTYvolatile|");
+    if (ty & mTYshared)
+        strcat(p, "mTYshared|");
+    if (ty & mTYxmmgpr)
+        strcat(p, "mTYxmmgpr|");
+    if (ty & mTYgprxmm)
+        strcat(p, "mTYgprxmm|");
+    if (ty & mTYthread)
+        strcat(p, "mTYthread|");
+    if (ty & mTYthreadData)
+        strcat(p, "mTYthreadData|");
+    const tyb = tybasic(ty);
+    if (tyb >= TYMAX)
+    {
+        if (tyb == TYMAX)
+            printf("TY TYMAX\n");
+        else
+            printf("TY %x\n",cast(int)ty);
+        assert(0);
+    }
+    strcat(p, "TY");
+    strcat(p, tystring[tyb]);
+    assert(strlen(p) <= MAX);
+    return strdup(p);
+}
+
+/*******************************
+ * Convert BC to string.
+ * Params:
+ *      bc = block exit code
+ * Returns:
+ *      pointer to string
+ */
+@trusted
+immutable(char)* bc_str(uint bc)
+{
+    return bcs[bc].ptr;
+}
+
+private immutable char[8][BC.max + 1] bcs =
+[
+    "unde   ", "goto_  ", "true   ", "ret   ", "retexp ",
+    "exit   ", "asm_   ", "switch ", "ifthen", "jmptab ",
+    "cpptry ", "catch_ ", "jump   ", "try   ", "filter ",
+    "final  ", "finRet ", "except ", "jcatch", "lpad   ",
+];
+
+
+/***************************
+ * Write out equation elem.
+ * Params:
+ *      e = equation to print
+ */
+
+@trusted
+void WReqn(elem* e)
+{
+    int nest;
+
+    nothrow void eqn(elem* e)
+    {
+        nothrow void nestEqn(elem* e)
+        {
+            ++nest;
+            ferr("(");
+            eqn(e);
+            ferr(")");
+            --nest;
+        }
+
+        if (!e)
+            return;
+        if (OTunary(e.Eoper))
+        {
+            ferr(oper_str(e.Eoper));
+            ferr(" ");
+            if (OTbinary(e.E1.Eoper))
+                nestEqn(e.E1);
+            else
+                eqn(e.E1);
+        }
+        else if (e.Eoper == OPcomma && !nest)
+        {
+            eqn(e.E1);
+            printf(";\n\t");
+            eqn(e.E2);
+        }
+        else if (OTbinary(e.Eoper))
+        {
+            if (OTbinary(e.E1.Eoper))
+                nestEqn(e.E1);
+            else
+                eqn(e.E1);
+            ferr(" ");
+            ferr(oper_str(e.Eoper));
+            ferr(" ");
+            if (e.Eoper == OPstreq)
+                printf("%d", cast(int)type_size(e.ET));
+            ferr(" ");
+            if (OTbinary(e.E2.Eoper))
+                nestEqn(e.E2);
+            else
+                eqn(e.E2);
+        }
+        else
+        {
+            switch (e.Eoper)
+            {
+                case OPconst:
+                    elem_print_const(e);
+                    break;
+
+                case OPrelconst:
+                    ferr("#");
+                    goto case OPvar;
+
+                case OPvar:
+                    printf("%s",e.Vsym.Sident.ptr);
+                    if (e.Vsym.Ssymnum != SYMIDX.max)
+                        printf("(%d)", cast(int) e.Vsym.Ssymnum);
+                    if (e.Voffset != 0)
+                    {
+                        if (e.Voffset.sizeof == 8)
+                            printf(".x%llx", cast(ulong)e.Voffset);
+                        else
+                            printf(".%d",cast(int)e.Voffset);
+                    }
+                    break;
+
+                case OPasm:
+                case OPstring:
+                    printf("\"%s\"",e.Vstring);
+                    if (e.Voffset)
+                        printf("+%lld",cast(long)e.Voffset);
+                    break;
+
+                case OPmark:
+                case OPgot:
+                case OPframeptr:
+                case OPhalt:
+                case OPdctor:
+                case OPddtor:
+                    ferr(oper_str(e.Eoper));
+                    ferr(" ");
+                    break;
+
+                case OPstrthis:
+                    break;
+
+                default:
+                    ferr(oper_str(e.Eoper));
+                    assert(0);
+            }
+        }
+    }
+
+    eqn(e);
+}
+
+@trusted
+void WRblockarray(block*[] bl)
+{
+    foreach (b; bl)
+    {
+        if (b && b.Bweight)
+            printf("B%d (%p) ",b.Bdfoidx,b);
+        else
+            printf("%p ",b);
+    }
+    ferr("\n");
+}
+
+@trusted
+void WRdefnod(ref GlobalOptimizer go)
+{
+    foreach (i; 0 .. go.defnod.length)
+    {
+        printf("defnod[%d] in B%u = (", go.defnod[i].DNblock.Bdfoidx, cast(uint)i);
+        WReqn(go.defnod[i].DNelem);
+        printf(");\n");
+    }
+}
+
+const(char)* fl_str(FL fl)
+{
+    immutable char*[FL.max + 1] fls =
+    [
+        "FL.unde",
+        "FL.const_",
+        "FL.oper",
+        "FL.func",
+        "FL.data",
+        "FL.reg",
+        "FL.pseudo",
+        "FL.auto_",
+        "FL.fast",
+        "FL.para",
+        "FL.extern_",
+        "FL.code",
+        "FL.block",
+        "FL.udata",
+        "FL.cs",
+        "FL.switch",
+        "FL.fltrg",
+        "FL.offset",
+        "FL.datseg",
+        "FL.ctor",
+        "FL.dtor",
+        "FL.regsave",
+        "FL.asm",
+        "FL.ndp",
+        "FL.fardata",
+        "FL.csdat",
+        "FL.localsize",
+        "FL.tlsdata",
+        "FL.bprel",
+        "FL.framehandler",
+        "FL.blockoff",
+        "FL.allocatmp",
+        "FL.stack",
+        "FL.dsymbol",
+        "FL.got",
+        "FL.gotoff",
+        "FL.funcarg",
+    ];
+    return fls[fl];
+}
+
+/***********************
+ * Write out block.
+ */
+
+@trusted
+void WRblock(block* b)
+{
+    if (OPTIMIZER)
+    {
+        if (b && b.Bweight)
+            printf("B%d: (%p), weight=%d",b.Bdfoidx,b,b.Bweight);
+        else
+            printf("block %p",b);
+        if (!b)
+        {
+            ferr("\n");
+            return;
+        }
+        printf(" flags=x%x weight=%d",b.Bflags,b.Bweight);
+        //printf("\tfile %p, line %d",b.Bfilptr,b.Blinnum);
+        printf(" BC.%s Btry=%p",bc_str(b.bc),b.Btry);
+        printf("\n");
+        printf("\tBpred: "); WRblockarray(b.Bpred[]);
+        printf("\tBsucc: "); WRblockarray(b.Bsucc[]);
+        if (b.Belem)
+        {
+            if (debugf)                     /* if full output       */
+                elem_print(b.Belem);
+            else
+            {
+                ferr("\t");
+                WReqn(b.Belem);
+                printf(";\n");
+            }
+        }
+        if (b.Bcode)
+            b.Bcode.print();
+        ferr("\n");
+    }
+    else
+    {
+        assert(b);
+        printf("%2d: BC.%s", b.Bnumber, bc_str(b.bc));
+        if (b.Btry)
+            printf(" Btry=B%d",b.Btry ? b.Btry.Bnumber : 0);
+        if (b.bc == BC.finally_)
+            printf(" b_ret=B%d", b.b_ret ? b.b_ret.Bnumber : 0);
+        if (b.Bsrcpos.Sfilename)
+            printf(" %s(%u)", b.Bsrcpos.Sfilename, b.Bsrcpos.Slinnum);
+        printf("\n");
+        if (b.Belem)
+        {
+            if (debugf)
+                elem_print(b.Belem);
+            else
+            {
+                ferr("\t");
+                WReqn(b.Belem);
+                printf(";\n");
+            }
+        }
+        if (b.Bpred.length)
+        {
+            printf("\tBpred:");
+            foreach (bl; b.Bpred[])
+                printf(" B%d",bl.Bnumber);
+            printf("\n");
+        }
+
+        switch (b.bc)
+        {
+            case BC.switch_:
+                printf("\tncases = %d\n", cast(int)b.Bswitch.length);
+                printf("\tdefault: B%d\n",b.Bsucc.length ? b.Bsucc[0].Bnumber : 0);
+                int j = 1;
+                foreach (val; b.Bswitch)
+                {
+                    printf("\tcase %lld: B%d\n", cast(long)val, b.Bsucc[j].Bnumber);
+                    ++j;
+                }
+                break;
+
+            case BC.iftrue:
+            case BC.goto_:
+            case BC.asm_:
+            case BC.cpptry:
+            case BC.catch_:
+            case BC.jcatch:
+            case BC.try_:
+            case BC.filter:
+            case BC.finally_:
+            case BC.lpad:
+            case BC.finRet:
+            case BC.except:
+                if (b.Bsucc.length)
+                {
+                    printf("\tBsucc:");
+                    foreach (ba; b.Bsucc[])
+                        printf(" B%d", ba.Bnumber);
+                    printf("\n");
+                }
+                break;
+
+            case BC.ret:
+            case BC.retexp:
+            case BC.exit:
+                break;
+
+            default:
+                printf("bc = %d\n", b.bc);
+                assert(0);
+        }
+    }
+}
+
+/*****************************
+ * Number the blocks starting at 1.
+ * So much more convenient than pointer values.
+ */
+void numberBlocks(block* startblock)
+{
+    uint n = 0;
+    for (block* b = startblock; b; b = b.Bnext)
+        b.Bnumber = ++n;
+}
+
+/**************************************
+ * Print out the intermediate code for a function.
+ * Params:
+ *      msg = label for the print
+ *      sfunc = function to print
+ *      startblock = intermediate code
+ */
+@trusted
+void WRfunc(const char* msg, Symbol* sfunc, block* startblock)
+{
+    printf("............%s...%s()\n", msg, sfunc.Sident.ptr);
+    numberBlocks(startblock);
+    for (block* b = startblock; b; b = b.Bnext)
+        WRblock(b);
+}

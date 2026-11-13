@@ -1,0 +1,10 @@
+/*
+TEST_OUTPUT:
+---
+fail_compilation/ice12673.d(9): Error: static assert:  `__traits(compiles, () { __error__ } )` is false
+---
+*/
+void main()
+{
+    static assert(__traits(compiles, { abcd(); }));
+}
